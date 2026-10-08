@@ -1,0 +1,11 @@
+[package]
+name = "organelle-manifest"
+version = "1.0.0"
+edition = "2021"
+description = "org-001: Organelle manifest schema v1 — name, version, contracts, authority, transports, receipts"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

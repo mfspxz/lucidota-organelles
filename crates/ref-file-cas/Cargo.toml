@@ -1,0 +1,10 @@
+[package]
+name = "ref-file-cas"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+organelle-manifest = { workspace = true }
+organelle-host = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

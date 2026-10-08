@@ -1,0 +1,14 @@
+[package]
+name = "surface-rest"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+organelle-manifest = { workspace = true }
+organelle-host = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+ref-kv-store = { path = "../ref-kv-store" }
+ref-text-transform = { path = "../ref-text-transform" }

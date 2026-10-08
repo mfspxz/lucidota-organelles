@@ -1,0 +1,12 @@
+[package]
+name = "organelle-host"
+version = "1.0.0"
+edition = "2021"
+description = "org-002: parkwreck-organelle-host rebuild — registry, router, fail-closed enforcement, receipts, profiles, authority, hot-swap"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+organelle-manifest = { workspace = true }

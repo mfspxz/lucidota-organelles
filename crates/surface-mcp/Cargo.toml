@@ -1,0 +1,23 @@
+[package]
+name = "surface-mcp"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+organelle-manifest = { workspace = true }
+organelle-host = { workspace = true }
+ref-kv-store = { path = "../ref-kv-store" }
+ref-text-transform = { path = "../ref-text-transform" }
+ref-hash-seal = { path = "../ref-hash-seal" }
+ref-http-fetch = { path = "../ref-http-fetch" }
+ref-json-validate = { path = "../ref-json-validate" }
+ref-time-oracle = { path = "../ref-time-oracle" }
+ref-geo-point = { path = "../ref-geo-point" }
+ref-ledger-append = { path = "../ref-ledger-append" }
+ref-notify = { path = "../ref-notify" }
+ref-scrape-extract = { path = "../ref-scrape-extract" }
+ref-model-call = { path = "../ref-model-call" }
+ref-file-cas = { path = "../ref-file-cas" }
+ref-common = { path = "../ref-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
