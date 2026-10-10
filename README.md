@@ -57,6 +57,11 @@ cargo test --offline -p organelle-equivalence -- --nocapture   # the matrix repo
 - Rust installed via rustup ($0); offline build from the local cargo cache.
 - Lock is never held across `handle()` — organelle→host callbacks can't deadlock.
 - Receipt id = sha256 over canonical JSON of the receipt body (content-addressed, not a UUID); chain verified offline by recomputation.
+- **R-2 bound (2026-10-10):** the receipt chain is in-memory only
+  (`Vec<Receipt>` behind an `RwLock`, no persistence); it is a
+  process-integrity structure, NOT tamper-evidence — anyone holding the
+  `Host` can rewrite history. Honestly unsigned (see AUDIT-APPLICATION.md
+  R-8). No hardening past this bound without an out-of-band anchor.
 - Denied vs Rejected are distinct verdicts (authz vs schema), both receipted.
 - MCP `dispatch()` is a pure function shared by the stdio loop and the harness — one JSON-RPC implementation, two membranes.
 - Valence mapping: pure/deterministic → Proven; stateful/unverified/external → Candidate. Documented per organelle.
