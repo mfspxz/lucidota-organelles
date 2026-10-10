@@ -257,6 +257,7 @@ impl TransportAdapter for NativeAdapter {
 }
 
 pub struct UnixAdapter {
+    host: Arc<Host>,
     path: PathBuf,
     next_id: u64,
     _server: surface_unix::UnixServerHandle,
@@ -266,11 +267,12 @@ impl UnixAdapter {
     pub fn new(outbox_dir: &str, cas_dir: &str) -> Self {
         let mut path = std::env::temp_dir();
         path.push(format!("organelle-eq-{}.sock", std::process::id()));
-        let server = surface_unix::spawn_server(build_host(outbox_dir, cas_dir), &path)
+        let host = build_host(outbox_dir, cas_dir);
+        let server = surface_unix::spawn_server(host.clone(), &path)
             .expect("unix surface spawn");
         // Give the accept loop a moment to bind.
         std::thread::sleep(Duration::from_millis(50));
-        UnixAdapter { path, next_id: 1, _server: server }
+        UnixAdapter { host, path, next_id: 1, _server: server }
     }
 }
 
@@ -289,12 +291,15 @@ impl TransportAdapter for UnixAdapter {
     ) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
+        // P0: authority comes from a host-issued grant, never from
+        // caller-supplied claims on the wire.
+        let grant = self.host.issue_grant(caller, caps.to_vec(), 300);
         let resp = surface_unix::UnixClient::call(
             &self.path,
             &surface_unix::WireRequest {
                 id,
                 caller: caller.to_string(),
-                capabilities: caps.to_vec(),
+                grant,
                 codon: codon.to_string(),
                 op: op.to_string(),
                 input,
@@ -345,13 +350,13 @@ impl TransportAdapter for McpAdapter {
             .ok_or_else(|| format!("no MCP tool for {codon}.{op}"))?;
         let id = self.next_id;
         self.next_id += 1;
+        // P0: the envelope carries a host-issued grant; capabilities are
+        // derived from the grant, never from caller-supplied claims.
+        let grant = self.host.issue_grant(caller, caps.to_vec(), 300);
         let mut args = input;
         if let Some(obj) = args.as_object_mut() {
+            obj.insert("grant".to_string(), Value::String(grant));
             obj.insert("caller".to_string(), Value::String(caller.to_string()));
-            obj.insert(
-                "capabilities".to_string(),
-                Value::Array(caps.iter().map(|c| Value::String(c.clone())).collect()),
-            );
         }
         let msg = serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
@@ -376,27 +381,30 @@ impl TransportAdapter for McpAdapter {
 }
 
 pub struct RestAdapter {
+    host: Arc<Host>,
     base: String,
     _server: surface_rest::RestHandle,
 }
 
 impl RestAdapter {
     pub fn new(outbox_dir: &str, cas_dir: &str) -> Self {
-        let server =
-            surface_rest::spawn(build_host(outbox_dir, cas_dir), 0).expect("rest spawn");
+        let host = build_host(outbox_dir, cas_dir);
+        let server = surface_rest::spawn(host.clone(), 0).expect("rest spawn");
         let base = server.base_url();
         std::thread::sleep(Duration::from_millis(50));
-        RestAdapter { base, _server: server }
+        RestAdapter { host, base, _server: server }
     }
 
-    fn post(&self, body: &Value) -> Result<Value, String> {
+    fn post(&self, grant: &str, body: &Value) -> Result<Value, String> {
         let text = serde_json::to_string(body).map_err(|e| e.to_string())?;
         let host_port = self.base.trim_start_matches("http://");
         let mut s = TcpStream::connect(host_port).map_err(|e| format!("connect: {e}"))?;
         s.set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| e.to_string())?;
+        // P0: authority travels as a host-issued grant in the Authorization
+        // header — never as caller-supplied claims in the body.
         let req = format!(
-            "POST /api/organelle/call HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+            "POST /api/organelle/call HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {grant}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
             text.len()
         );
         s.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
@@ -423,12 +431,12 @@ impl TransportAdapter for RestAdapter {
     ) -> Result<Value, String> {
         let body = serde_json::json!({
             "caller": caller,
-            "capabilities": caps,
             "codon": codon,
             "op": op,
             "input": input,
         });
-        let resp = self.post(&body)?;
+        let grant = self.host.issue_grant(caller, caps.to_vec(), 300);
+        let resp = self.post(&grant, &body)?;
         if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             resp.get("output").cloned().ok_or_else(|| "ok without output".to_string())
         } else {

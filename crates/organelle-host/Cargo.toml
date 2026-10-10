@@ -10,3 +10,4 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 organelle-manifest = { workspace = true }
+hmac = "=0.12.1"

@@ -4,7 +4,7 @@
 //! The contract tests are transport-agnostic, so this surface runs the
 //! identical scenarios as native/REST/MCP (see organelle-equivalence).
 
-use organelle_host::{CallContext, Host};
+use organelle_host::Host;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -15,12 +15,20 @@ use std::thread;
 use std::time::Duration;
 
 /// One call, JSON-lines encoded.
+///
+/// P0: authority is unforgeable at this boundary. The request carries NO
+/// capability claims — only a host-issued, HMAC-authenticated `grant`.
+/// Capabilities are derived solely from the verified grant; unknown fields
+/// (including any caller-supplied `capabilities`) are rejected outright.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireRequest {
     pub id: u64,
+    /// Claimed caller identity; must match the grant's subject.
     pub caller: String,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
+    /// Host-issued capability grant (see `Host::issue_grant`). Empty or
+    /// invalid -> denial, never default-allow.
+    pub grant: String,
     pub codon: String,
     pub op: String,
     pub input: Value,
@@ -69,8 +77,10 @@ fn handle_conn(host: Arc<Host>, stream: UnixStream) {
                 receipt: String::new(),
             },
             Ok(req) => {
-                let ctx = CallContext::new(req.caller.clone(), req.capabilities.clone());
-                match host.call(&ctx, &req.codon, &req.op, req.input) {
+                // Authority comes ONLY from the grant. The claimed caller
+                // identity is bound to the grant's subject inside
+                // `call_with_grant`; a missing/invalid grant is denied.
+                match host.call_with_grant(&req.grant, Some(&req.caller), &req.codon, &req.op, req.input) {
                     Ok(output) => {
                         let receipt = host.receipts().last().map(|r| r.id.clone()).unwrap_or_default();
                         WireResponse { id: req.id, ok: true, output: Some(output), error: None, receipt }
@@ -165,6 +175,7 @@ impl UnixClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use organelle_host::CallContext;
 
     fn tmp_sock(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -179,20 +190,30 @@ mod tests {
         h
     }
 
+    fn req(id: u64, h: &Host, caller: &str, caps: &[&str], codon: &str, op: &str, input: Value) -> WireRequest {
+        WireRequest {
+            id,
+            caller: caller.into(),
+            grant: h.issue_grant(
+                caller,
+                caps.iter().map(|s| s.to_string()).collect(),
+                300,
+            ),
+            codon: codon.into(),
+            op: op.into(),
+            input,
+        }
+    }
+
     #[test]
     fn roundtrip_ok() {
+        let h = host();
         let path = tmp_sock("ok");
-        let srv = spawn_server(host(), &path).unwrap();
+        let srv = spawn_server(h.clone(), &path).unwrap();
         let resp = UnixClient::call(
             &path,
-            &WireRequest {
-                id: 1,
-                caller: "test".into(),
-                capabilities: vec![],
-                codon: "tt".into(),
-                op: "transform".into(),
-                input: serde_json::json!({"text": "hi", "mode": "upper"}),
-            },
+            &req(1, &h, "test", &[], "tt", "transform",
+                serde_json::json!({"text": "hi", "mode": "upper"})),
         )
         .unwrap();
         assert!(resp.ok);
@@ -204,23 +225,34 @@ mod tests {
 
     #[test]
     fn denial_crosses_socket_with_receipt() {
+        let h = host();
         let path = tmp_sock("denied");
-        let srv = spawn_server(host(), &path).unwrap();
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        // Valid grant, but no kv.write -> the host denies on authority.
         let resp = UnixClient::call(
             &path,
-            &WireRequest {
-                id: 2,
-                caller: "test".into(),
-                capabilities: vec![],
-                codon: "kv".into(),
-                op: "put".into(),
-                input: serde_json::json!({"key": "a", "value": 1}),
-            },
+            &req(2, &h, "test", &[], "kv", "put",
+                serde_json::json!({"key": "a", "value": 1})),
         )
         .unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().verdict, "Denied");
         assert!(!resp.receipt.is_empty());
+        srv.shutdown();
+    }
+
+    #[test]
+    fn granted_capability_allows_gated_op() {
+        let h = host();
+        let path = tmp_sock("gated");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        let resp = UnixClient::call(
+            &path,
+            &req(3, &h, "test", &["kv.write"], "kv", "put",
+                serde_json::json!({"key": "a", "value": 1})),
+        )
+        .unwrap();
+        assert!(resp.ok, "{resp:?}");
         srv.shutdown();
     }
 
@@ -250,13 +282,155 @@ mod tests {
         let native = h.call(&ctx, "tt", "transform", input.clone()).unwrap();
         let via_socket = UnixClient::call(
             &path,
-            &WireRequest { id: 9, caller: "test".into(), capabilities: vec![], codon: "tt".into(), op: "transform".into(), input },
+            &req(9, &h, "test", &[], "tt", "transform", input),
         )
         .unwrap();
         assert_eq!(
             organelle_manifest::canonical_json(&native),
             organelle_manifest::canonical_json(&via_socket.output.unwrap())
         );
+        srv.shutdown();
+    }
+
+    // -- P0 forged-capability tests: every forgery must be denied ---------
+
+    fn raw_line(path: &Path, line: &str) -> WireResponse {
+        let mut stream = UnixStream::connect(path).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream.write_all(line.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut out = String::new();
+        reader.read_line(&mut out).unwrap();
+        serde_json::from_str(out.trim()).unwrap()
+    }
+
+    #[test]
+    fn forged_grant_denied() {
+        let h = host();
+        let path = tmp_sock("forged");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        // Take a valid grant and flip a payload nibble: the signature
+        // is checked before the payload is even decoded, so this must
+        // fail as an invalid signature.
+        let good = h.issue_grant("test", vec!["kv.write".to_string()], 300);
+        let (payload_hex, tag) = good.split_once('.').unwrap();
+        let mut chars: Vec<char> = payload_hex.chars().collect();
+        chars[0] = if chars[0] == '0' { '1' } else { '0' };
+        let forged = format!("{}.{}", chars.into_iter().collect::<String>(), tag);
+        let resp = UnixClient::call(
+            &path,
+            &WireRequest {
+                id: 1, caller: "test".into(), grant: forged,
+                codon: "kv".into(), op: "put".into(),
+                input: serde_json::json!({"key": "a", "value": 1}),
+            },
+        )
+        .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().verdict, "Denied");
+        assert!(resp.error.unwrap().reason.contains("signature"));
+        assert!(!resp.receipt.is_empty());
+        srv.shutdown();
+    }
+
+    #[test]
+    fn escalated_capability_denied() {
+        let h = host();
+        let path = tmp_sock("escalate");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        // Grant confers only kv.read; kv.put requires kv.write.
+        let resp = UnixClient::call(
+            &path,
+            &req(1, &h, "test", &["kv.read"], "kv", "put",
+                serde_json::json!({"key": "a", "value": 1})),
+        )
+        .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().verdict, "Denied");
+        assert!(resp.error.unwrap().reason.contains("kv.write"));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn caller_supplied_capabilities_rejected() {
+        // The old forgeable field is gone: sending it is a malformed
+        // request (input-rejected), not silently ignored.
+        let h = host();
+        let path = tmp_sock("capfield");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        let grant = h.issue_grant("test", vec![], 300);
+        let line = serde_json::json!({
+            "id": 1, "caller": "test", "grant": grant,
+            "capabilities": ["kv.write", "admin.*"],
+            "codon": "kv", "op": "put",
+            "input": {"key": "a", "value": 1},
+        })
+        .to_string();
+        let resp = raw_line(&path, &line);
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().verdict, "rejected");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn replayed_grant_denied() {
+        let h = host();
+        let path = tmp_sock("replay");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        let grant = h.issue_single_use_grant("test", vec!["kv.write".to_string()], 300);
+        let mk = |id| WireRequest {
+            id, caller: "test".into(), grant: grant.clone(),
+            codon: "kv".into(), op: "put".into(),
+            input: serde_json::json!({"key": "a", "value": 1}),
+        };
+        let first = UnixClient::call(&path, &mk(1)).unwrap();
+        assert!(first.ok, "{first:?}");
+        let second = UnixClient::call(&path, &mk(2)).unwrap();
+        assert!(!second.ok);
+        assert_eq!(second.error.as_ref().unwrap().verdict, "Denied");
+        assert!(second.error.unwrap().reason.contains("replay"));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn wrong_caller_grant_denied() {
+        let h = host();
+        let path = tmp_sock("wrongcaller");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        // Grant issued to alice, presented as mallory.
+        let grant = h.issue_grant("alice", vec!["kv.write".to_string()], 300);
+        let resp = UnixClient::call(
+            &path,
+            &WireRequest {
+                id: 1, caller: "mallory".into(), grant,
+                codon: "kv".into(), op: "put".into(),
+                input: serde_json::json!({"key": "a", "value": 1}),
+            },
+        )
+        .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().verdict, "Denied");
+        assert!(resp.error.unwrap().reason.contains("does not match grant subject"));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn missing_grant_denied_not_allowed() {
+        let h = host();
+        let path = tmp_sock("nogrant");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        let resp = UnixClient::call(
+            &path,
+            &WireRequest {
+                id: 1, caller: "test".into(), grant: String::new(),
+                codon: "tt".into(), op: "transform".into(),
+                input: serde_json::json!({"text": "hi", "mode": "upper"}),
+            },
+        )
+        .unwrap();
+        assert!(!resp.ok, "no auth material must never default-allow");
+        assert_eq!(resp.error.as_ref().unwrap().verdict, "Denied");
         srv.shutdown();
     }
 }

@@ -4,11 +4,16 @@
 //! served over a dependency-free hand-rolled HTTP/1.1 listener (std only).
 //!
 //! - `GET  /api/organelles`      — routed manifests
-//! - `POST /api/organelle/call`  — `{caller, capabilities, codon, op, input}`
+//! - `POST /api/organelle/call`  — `{caller, codon, op, input}` + `Authorization: Bearer <grant>`
 //! - `GET  /openapi.json`        — generated OpenAPI 3.0
 //! - `GET  /api/receipts?limit=N`— recent receipts (audit)
+//!
+//! P0: authority is unforgeable at this boundary. Callers authenticate with
+//! a host-issued capability grant as a Bearer token; capabilities are
+//! derived only from the verified grant. A `capabilities` field in the body
+//! is rejected outright — authority is granted, never claimed.
 
-use organelle_host::{CallContext, Host};
+use organelle_host::Host;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,6 +22,9 @@ use std::thread;
 use std::time::Duration;
 
 /// OpenAPI 3.0 generated from the host's routed manifests.
+///
+/// P0: the call operation takes no capability claims. Authority travels as
+/// a host-issued grant in the `Authorization: Bearer` header.
 pub fn openapi_json(host: &Host) -> Value {
     let mut paths = serde_json::Map::new();
     for m in host.list_manifests() {
@@ -28,6 +36,7 @@ pub fn openapi_json(host: &Host) -> Value {
                     "post": {
                         "summary": c.description,
                         "operationId": format!("{}.{}", m.name, c.op),
+                        "security": [{"bearerAuth": []}],
                         "requestBody": {
                             "required": true,
                             "content": {
@@ -36,8 +45,7 @@ pub fn openapi_json(host: &Host) -> Value {
                                         "type": "object",
                                         "required": ["input"],
                                         "properties": {
-                                            "caller": {"type": "string"},
-                                            "capabilities": {"type": "array", "items": {"type": "string"}},
+                                            "caller": {"type": "string", "description": "claimed caller identity; must match the grant's subject"},
                                             "input": c.input_schema,
                                         }
                                     }
@@ -58,6 +66,15 @@ pub fn openapi_json(host: &Host) -> Value {
         "openapi": "3.0.0",
         "info": {"title": "parkwreck-organelle-host", "version": "1.0.0"},
         "paths": paths,
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "host-issued capability grant (see Host::issue_grant)",
+                }
+            }
+        },
     })
 }
 
@@ -65,6 +82,7 @@ struct HttpRequest {
     method: String,
     path: String,
     query: String,
+    authorization: Option<String>,
     body: Vec<u8>,
 }
 
@@ -100,10 +118,14 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         None => (target, String::new()),
     };
     let mut content_length = 0usize;
+    let mut authorization: Option<String> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().unwrap_or(0);
+            }
+            if k.trim().eq_ignore_ascii_case("authorization") {
+                authorization = Some(v.trim().to_string());
             }
         }
     }
@@ -118,7 +140,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         }
     }
     body.truncate(read);
-    Ok(HttpRequest { method, path, query, body })
+    Ok(HttpRequest { method, path, query, authorization, body })
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
@@ -194,17 +216,32 @@ fn handle_conn(host: Arc<Host>, mut stream: TcpStream) {
                     return;
                 }
             };
-            let caller = body.get("caller").and_then(|c| c.as_str()).unwrap_or("rest").to_string();
-            let caps: Vec<String> = body
-                .get("capabilities")
-                .and_then(|c| c.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default();
+            // P0: caller-supplied capability claims are rejected outright —
+            // authority comes only from the host-issued grant.
+            if body.get("capabilities").is_some() {
+                respond(
+                    &mut stream,
+                    400,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": {"verdict": "Rejected", "reason": "capabilities must be granted, not claimed"},
+                        "receipt": "",
+                    }),
+                );
+                return;
+            }
+            // The grant travels as a Bearer token (Authorization header);
+            // no auth material -> denial, never default-allow.
+            let grant = req
+                .authorization
+                .as_deref()
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or("");
+            let caller = body.get("caller").and_then(|c| c.as_str());
             let codon = body.get("codon").and_then(|c| c.as_str()).unwrap_or("");
             let op = body.get("op").and_then(|c| c.as_str()).unwrap_or("");
             let input = body.get("input").cloned().unwrap_or(Value::Null);
-            let ctx = CallContext::new(caller, caps);
-            match host.call(&ctx, codon, op, input) {
+            match host.call_with_grant(grant, caller, codon, op, input) {
                 Ok(output) => {
                     let receipt = host.receipts().last().map(|r| r.id.clone()).unwrap_or_default();
                     respond(
@@ -308,12 +345,15 @@ mod tests {
         (status, serde_json::from_str(body).unwrap())
     }
 
-    fn post(port: u16, path: &str, body: &Value) -> (String, Value) {
+    fn post_auth(port: u16, path: &str, grant: Option<&str>, body: &Value) -> (String, Value) {
         let text = serde_json::to_string(body).unwrap();
+        let auth = grant
+            .map(|g| format!("Authorization: Bearer {g}\r\n"))
+            .unwrap_or_default();
         raw(
             port,
             &format!(
-                "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                "POST {path} HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
                 text.len()
             ),
         )
@@ -321,6 +361,10 @@ mod tests {
 
     fn get(port: u16, path: &str) -> (String, Value) {
         raw(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+    }
+
+    fn grant_for(h: &Host, caller: &str, caps: &[&str]) -> String {
+        h.issue_grant(caller, caps.iter().map(|s| s.to_string()).collect(), 300)
     }
 
     #[test]
@@ -334,10 +378,13 @@ mod tests {
 
     #[test]
     fn call_ok() {
-        let srv = spawn(host(), 0).unwrap();
-        let (status, body) = post(
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        let g = grant_for(&h, "t", &[]);
+        let (status, body) = post_auth(
             srv.port(),
             "/api/organelle/call",
+            Some(&g),
             &serde_json::json!({
                 "caller": "t", "codon": "tt", "op": "transform",
                 "input": {"text": "hi", "mode": "upper"},
@@ -351,11 +398,34 @@ mod tests {
     }
 
     #[test]
-    fn call_denied_with_receipt() {
-        let srv = spawn(host(), 0).unwrap();
-        let (status, body) = post(
+    fn granted_capability_allows_gated_op() {
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        let g = grant_for(&h, "t", &["kv.write"]);
+        let (status, body) = post_auth(
             srv.port(),
             "/api/organelle/call",
+            Some(&g),
+            &serde_json::json!({
+                "caller": "t", "codon": "kv", "op": "put",
+                "input": {"key": "a", "value": 1},
+            }),
+        );
+        assert!(status.contains("200"), "{status} {body}");
+        assert_eq!(body["ok"], serde_json::json!(true));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn call_denied_with_receipt() {
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        // Valid grant, but no kv.write -> host authority denial.
+        let g = grant_for(&h, "t", &[]);
+        let (status, body) = post_auth(
+            srv.port(),
+            "/api/organelle/call",
+            Some(&g),
             &serde_json::json!({
                 "caller": "t", "codon": "kv", "op": "put",
                 "input": {"key": "a", "value": 1},
@@ -376,15 +446,24 @@ mod tests {
         assert_eq!(body["openapi"], serde_json::json!("3.0.0"));
         assert!(body["paths"]["/api/organelle/tt/transform"].is_object());
         assert!(body["paths"]["/api/organelle/kv/put"].is_object());
+        // No capability claims in the advertised schema; bearer documented.
+        let schema_props =
+            &body["paths"]["/api/organelle/kv/put"]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"]["properties"];
+        assert!(schema_props.get("capabilities").is_none());
+        assert!(body["components"]["securitySchemes"]["bearerAuth"].is_object());
         srv.shutdown();
     }
 
     #[test]
     fn receipts_endpoint() {
-        let srv = spawn(host(), 0).unwrap();
-        let _ = post(
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        let g = grant_for(&h, "t", &[]);
+        let _ = post_auth(
             srv.port(),
             "/api/organelle/call",
+            Some(&g),
             &serde_json::json!({"caller": "t", "codon": "tt", "op": "transform",
                 "input": {"text": "a", "mode": "upper"}}),
         );
@@ -399,6 +478,136 @@ mod tests {
         let srv = spawn(host(), 0).unwrap();
         let (status, _) = get(srv.port(), "/nope");
         assert!(status.contains("404"), "{status}");
+        srv.shutdown();
+    }
+
+    // -- P0 forged-capability tests: every forgery must be denied ---------
+
+    #[test]
+    fn forged_grant_denied() {
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        let good = grant_for(&h, "t", &["kv.write"]);
+        let (payload_hex, tag) = good.split_once('.').unwrap();
+        let mut chars: Vec<char> = payload_hex.chars().collect();
+        chars[0] = if chars[0] == '0' { '1' } else { '0' };
+        let forged = format!("{}.{}", chars.into_iter().collect::<String>(), tag);
+        let (status, body) = post_auth(
+            srv.port(),
+            "/api/organelle/call",
+            Some(&forged),
+            &serde_json::json!({
+                "caller": "t", "codon": "kv", "op": "put",
+                "input": {"key": "a", "value": 1},
+            }),
+        );
+        assert!(status.contains("400"), "{status}");
+        assert_eq!(body["error"]["verdict"], serde_json::json!("Denied"));
+        assert!(body["error"]["reason"].as_str().unwrap().contains("signature"));
+        assert!(!body["receipt"].as_str().unwrap().is_empty());
+        srv.shutdown();
+    }
+
+    #[test]
+    fn escalated_capability_denied() {
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        // Grant confers no kv.write; the gated op must stay denied.
+        let g = grant_for(&h, "t", &[]);
+        let (status, body) = post_auth(
+            srv.port(),
+            "/api/organelle/call",
+            Some(&g),
+            &serde_json::json!({
+                "caller": "t", "codon": "kv", "op": "put",
+                "input": {"key": "a", "value": 1},
+            }),
+        );
+        assert!(status.contains("400"), "{status}");
+        assert_eq!(body["error"]["verdict"], serde_json::json!("Denied"));
+        assert!(body["error"]["reason"].as_str().unwrap().contains("kv.write"));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn caller_supplied_capabilities_rejected() {
+        // Capabilities in the body are not ignored — they are rejected.
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        let g = grant_for(&h, "t", &[]);
+        let (status, body) = post_auth(
+            srv.port(),
+            "/api/organelle/call",
+            Some(&g),
+            &serde_json::json!({
+                "caller": "t", "capabilities": ["kv.write", "admin.*"],
+                "codon": "kv", "op": "put",
+                "input": {"key": "a", "value": 1},
+            }),
+        );
+        assert!(status.contains("400"), "{status}");
+        assert_eq!(body["error"]["verdict"], serde_json::json!("Rejected"));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn replayed_grant_denied() {
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        let g = h.issue_single_use_grant("t", vec!["kv.write".to_string()], 300);
+        let body = serde_json::json!({
+            "caller": "t", "codon": "kv", "op": "put",
+            "input": {"key": "a", "value": 1},
+        });
+        let (s1, b1) = post_auth(srv.port(), "/api/organelle/call", Some(&g), &body);
+        assert!(s1.contains("200"), "{s1} {b1}");
+        let (s2, b2) = post_auth(srv.port(), "/api/organelle/call", Some(&g), &body);
+        assert!(s2.contains("400"), "{s2}");
+        assert_eq!(b2["error"]["verdict"], serde_json::json!("Denied"));
+        assert!(b2["error"]["reason"].as_str().unwrap().contains("replay"));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn wrong_caller_grant_denied() {
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        // Grant issued to alice, presented as mallory.
+        let g = h.issue_grant("alice", vec!["kv.write".to_string()], 300);
+        let (status, body) = post_auth(
+            srv.port(),
+            "/api/organelle/call",
+            Some(&g),
+            &serde_json::json!({
+                "caller": "mallory", "codon": "kv", "op": "put",
+                "input": {"key": "a", "value": 1},
+            }),
+        );
+        assert!(status.contains("400"), "{status}");
+        assert_eq!(body["error"]["verdict"], serde_json::json!("Denied"));
+        assert!(body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not match grant subject"));
+        srv.shutdown();
+    }
+
+    #[test]
+    fn missing_grant_denied_not_allowed() {
+        let h = host();
+        let srv = spawn(h.clone(), 0).unwrap();
+        let (status, body) = post_auth(
+            srv.port(),
+            "/api/organelle/call",
+            None,
+            &serde_json::json!({
+                "caller": "t", "codon": "tt", "op": "transform",
+                "input": {"text": "hi", "mode": "upper"},
+            }),
+        );
+        assert!(status.contains("400"), "{status}");
+        assert_eq!(body["ok"], serde_json::json!(false));
+        assert_eq!(body["error"]["verdict"], serde_json::json!("Denied"));
         srv.shutdown();
     }
 }

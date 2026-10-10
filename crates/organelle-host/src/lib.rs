@@ -35,6 +35,9 @@ use std::sync::{
     Arc, RwLock,
 };
 
+mod authority;
+pub use authority::{GrantError, GrantErrorKind, VerifiedGrant};
+
 // ---------------------------------------------------------------------------
 // Organelle trait (the protein side of the membrane)
 // ---------------------------------------------------------------------------
@@ -296,6 +299,8 @@ struct HostInner {
     receipts: Vec<Receipt>,
     boundary_denials: Vec<BoundaryDenial>,
     receipt_seq: u64,
+    /// Sole issuer/verifier of capability grants (P0: unforgeable authority).
+    authority: authority::GrantAuthority,
 }
 
 /// parkwreck-organelle-host. Share via `Arc<Host>`; all methods take `&self`.
@@ -304,7 +309,7 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new() -> Arc<Self> {
+    fn with_authority(authority: authority::GrantAuthority) -> Arc<Self> {
         Arc::new(Host {
             inner: RwLock::new(HostInner {
                 organelles: HashMap::new(),
@@ -316,8 +321,21 @@ impl Host {
                 receipts: Vec::new(),
                 boundary_denials: Vec::new(),
                 receipt_seq: 0,
+                authority,
             }),
         })
+    }
+
+    pub fn new() -> Arc<Self> {
+        Self::with_authority(authority::GrantAuthority::new())
+    }
+
+    /// Build a host with an operator-provided grant key. Grants minted under
+    /// a stable key verify across restarts; the operator owns the key's
+    /// secrecy, distribution, and rotation (secret-freeze: this host never
+    /// logs or exposes it).
+    pub fn with_grant_key(key: [u8; 32]) -> Arc<Self> {
+        Self::with_authority(authority::GrantAuthority::with_key(key))
     }
 
     // -- receipts --------------------------------------------------------
@@ -633,6 +651,115 @@ impl Host {
         input: Value,
     ) -> Result<Value, CallError> {
         self.call_with_gate2(ctx, codon, op, input)
+    }
+
+    // -- capability grants (P0: unforgeable authority) -----------------------
+    //
+    // The native `call` above takes a `CallContext` directly: it is the
+    // in-process surface, where the caller is code linked into this process.
+    // Every EXTERNAL surface (unix socket, MCP stdio, REST) must enter here
+    // instead. Capabilities are derived ONLY from a host-issued,
+    // HMAC-authenticated grant; caller-supplied capability claims are never
+    // read. Fail-closed: any grant problem is a Denied verdict with a
+    // receipt, never a default-allow.
+
+    /// Issue a multi-use capability grant for `caller`, valid `ttl_secs`
+    /// seconds. This is the control plane: whoever operates the host process
+    /// mints grants for its callers out-of-band.
+    pub fn issue_grant(&self, caller: &str, capabilities: Vec<String>, ttl_secs: u64) -> String {
+        self.inner
+            .read()
+            .unwrap()
+            .authority
+            .issue(caller, capabilities, ttl_secs)
+    }
+
+    /// Issue a single-use capability grant: honored once, replays denied.
+    pub fn issue_single_use_grant(
+        &self,
+        caller: &str,
+        capabilities: Vec<String>,
+        ttl_secs: u64,
+    ) -> String {
+        self.inner
+            .read()
+            .unwrap()
+            .authority
+            .issue_single_use(caller, capabilities, ttl_secs)
+    }
+
+    /// Verify a grant token (public so surfaces can pre-check; the call path
+    /// below is the enforced entry point).
+    pub fn verify_grant(&self, token: &str) -> Result<VerifiedGrant, GrantError> {
+        self.inner.write().unwrap().authority.verify(token)
+    }
+
+    /// External-surface entry point. Authenticates the grant, binds the
+    /// optional claimed caller identity to the grant's subject, builds the
+    /// `CallContext` from the grant alone, and dispatches. The denial /
+    /// rejection / failure distinction of `call` is preserved; grant
+    /// failures are Denied (never Rejected — the request was well-formed,
+    /// the authority was not).
+    pub fn call_with_grant(
+        &self,
+        grant: &str,
+        caller_claim: Option<&str>,
+        codon: &str,
+        op: &str,
+        input: Value,
+    ) -> Result<Value, CallError> {
+        let caller_label = caller_claim.unwrap_or("unauthenticated");
+        let verified = match self.verify_grant(grant) {
+            Ok(v) => v,
+            Err(e) => return Err(self.grant_denied(caller_label, codon, op, &input, e.to_string())),
+        };
+        if let Some(claim) = caller_claim {
+            if claim != verified.caller {
+                return Err(self.grant_denied(
+                    caller_label,
+                    codon,
+                    op,
+                    &input,
+                    format!(
+                        "caller claim \"{claim}\" does not match grant subject"
+                    ),
+                ));
+            }
+        }
+        // Capabilities come ONLY from the trusted grant. Whatever the
+        // caller claimed on the wire is not even read.
+        let ctx = CallContext::new(verified.caller, verified.capabilities);
+        self.call(&ctx, codon, op, input)
+    }
+
+    /// Emit a fail-closed denial receipt for a grant failure and return the
+    /// `CallError` carrying its id (mirrors the Phase1::Stop arm: refusal
+    /// without a receipt is a bug).
+    fn grant_denied(
+        &self,
+        caller: &str,
+        codon: &str,
+        op: &str,
+        input: &Value,
+        reason: String,
+    ) -> CallError {
+        let receipt_id = self.emit_receipt(Self::receipt_shell(
+            ReceiptKind::Invocation,
+            codon,
+            op,
+            "-",
+            caller,
+            input,
+            format!("denied:{reason}"),
+            CallVerdict::Denied,
+            Valence::Candidate,
+            Some(reason.clone()),
+        ));
+        CallError {
+            verdict: CallVerdict::Denied,
+            reason,
+            receipt_id,
+        }
     }
 
     /// Authorize op + capability + input schema. Pure w.r.t. &self.
@@ -1287,6 +1414,97 @@ mod tests {
         // With the capability it passes.
         let out = h.call(&ctx_with(&["te.write"]), "te", "sealed", serde_json::json!({})).unwrap();
         assert_eq!(out["sealed"], serde_json::json!(true));
+    }
+
+    // -- P0: call_with_grant — authority only from trusted grants --------
+
+    fn grant_ctx_caps(h: &Host, caller: &str, caps: &[&str]) -> String {
+        h.issue_grant(caller, caps.iter().map(|s| s.to_string()).collect(), 300)
+    }
+
+    #[test]
+    fn grant_call_derives_caps_from_grant_only() {
+        let h = echo_host();
+        // Grant confers te.write -> gated op passes.
+        let g = grant_ctx_caps(&h, "ext", &["te.write"]);
+        let out = h
+            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(out["sealed"], serde_json::json!(true));
+        // Grant without the capability -> denied by the host's authorize().
+        let g2 = grant_ctx_caps(&h, "ext", &[]);
+        let e = h
+            .call_with_grant(&g2, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Denied);
+        assert!(e.reason.contains("te.write"));
+        assert!(!e.receipt_id.is_empty());
+    }
+
+    #[test]
+    fn grant_call_tampered_denied_and_receipted() {
+        let h = echo_host();
+        let g = grant_ctx_caps(&h, "ext", &["te.write"]);
+        let (payload_hex, tag) = g.split_once('.').unwrap();
+        let mut chars: Vec<char> = payload_hex.chars().collect();
+        chars[0] = if chars[0] == '0' { '1' } else { '0' };
+        let forged = format!("{}.{}", chars.into_iter().collect::<String>(), tag);
+        let e = h
+            .call_with_grant(&forged, Some("ext"), "te", "echo", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Denied);
+        assert!(e.reason.contains("signature"));
+        assert!(!e.receipt_id.is_empty());
+        let r = h.receipts().last().unwrap().clone();
+        assert_eq!(r.id, e.receipt_id);
+        assert_eq!(r.verdict, CallVerdict::Denied);
+    }
+
+    #[test]
+    fn grant_call_wrong_caller_denied() {
+        let h = echo_host();
+        let g = grant_ctx_caps(&h, "alice", &["te.write"]);
+        let e = h
+            .call_with_grant(&g, Some("mallory"), "te", "sealed", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Denied);
+        assert!(e.reason.contains("does not match grant subject"));
+    }
+
+    #[test]
+    fn grant_call_missing_grant_denied_never_allowed() {
+        let h = echo_host();
+        for grant in ["", "garbage", "a.b"] {
+            let e = h
+                .call_with_grant(grant, Some("ext"), "te", "echo", serde_json::json!({}))
+                .unwrap_err();
+            assert_eq!(e.verdict, CallVerdict::Denied, "grant {grant:?}");
+        }
+    }
+
+    #[test]
+    fn grant_call_single_use_replay_denied() {
+        let h = echo_host();
+        let g = h.issue_single_use_grant("ext", vec!["te.write".to_string()], 300);
+        assert!(h
+            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .is_ok());
+        let e = h
+            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Denied);
+        assert!(e.reason.contains("replay"));
+    }
+
+    #[test]
+    fn grant_expired_denied() {
+        let h = echo_host();
+        let g = h.issue_grant("ext", vec!["te.write".to_string()], 0);
+        let e = h
+            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Denied);
+        assert!(e.reason.contains("expired"));
     }
 
     #[test]

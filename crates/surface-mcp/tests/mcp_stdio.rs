@@ -1,7 +1,29 @@
 //! org-005 — MCP surface over a real child process speaking JSON-RPC 2.0.
+//!
+//! P0: the child authenticates callers with capability grants. The test
+//! seeds the child's grant key via ORGANELLE_GRANT_KEY and mints grants
+//! in-process with the same key (the operator's out-of-band issuance path).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+
+/// Test-only grant key (NOT a secret — 32 zero bytes, hex).
+const TEST_GRANT_KEY_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn test_host() -> Arc<organelle_host::Host> {
+    organelle_host::Host::with_grant_key([0u8; 32])
+}
+
+/// Mint a grant the child will accept (same key as the child's).
+fn grant(caller: &str, caps: &[&str]) -> String {
+    test_host().issue_grant(
+        caller,
+        caps.iter().map(|s| s.to_string()).collect(),
+        300,
+    )
+}
 
 struct Mcp {
     child: std::process::Child,
@@ -27,6 +49,7 @@ impl Mcp {
         let bin = Self::bin_path();
         assert!(bin.exists(), "mcp stdio binary missing at {}", bin.display());
         let mut child = Command::new(bin)
+            .env("ORGANELLE_GRANT_KEY", TEST_GRANT_KEY_HEX)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -70,11 +93,12 @@ fn initialize_and_list() {
 fn call_tool_ok() {
     let mut m = Mcp::spawn();
     let _ = m.request("initialize", serde_json::json!({}));
+    let g = grant("mcp-test", &[]);
     let out = m.request(
         "tools/call",
         serde_json::json!({
             "name": "text-transform.transform",
-            "arguments": {"text": "hi", "mode": "upper", "caller": "mcp-test"},
+            "arguments": {"text": "hi", "mode": "upper", "caller": "mcp-test", "grant": g},
         }),
     );
     assert_eq!(out["result"]["isError"], serde_json::json!(false));
@@ -87,6 +111,7 @@ fn call_tool_ok() {
 fn call_denied_is_error_not_crash() {
     let mut m = Mcp::spawn();
     let _ = m.request("initialize", serde_json::json!({}));
+    // No grant at all -> fail-closed denial, not a crash, not a pass.
     let out = m.request(
         "tools/call",
         serde_json::json!({
@@ -96,6 +121,30 @@ fn call_denied_is_error_not_crash() {
     );
     assert_eq!(out["result"]["isError"], serde_json::json!(true));
     assert!(out["result"]["content"][0]["text"].as_str().unwrap().contains("Denied"));
+}
+
+#[test]
+fn forged_grant_over_stdio_denied() {
+    let mut m = Mcp::spawn();
+    let _ = m.request("initialize", serde_json::json!({}));
+    // Valid grant, then tamper the payload: signature must fail at the
+    // real process boundary too.
+    let good = grant("mcp-test", &["kv.write"]);
+    let (payload_hex, tag) = good.split_once('.').unwrap();
+    let mut chars: Vec<char> = payload_hex.chars().collect();
+    chars[0] = if chars[0] == '0' { '1' } else { '0' };
+    let forged = format!("{}.{}", chars.into_iter().collect::<String>(), tag);
+    let out = m.request(
+        "tools/call",
+        serde_json::json!({
+            "name": "kv-store.put",
+            "arguments": {"key": "a", "value": 1, "caller": "mcp-test", "grant": forged},
+        }),
+    );
+    assert_eq!(out["result"]["isError"], serde_json::json!(true));
+    let text = out["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Denied"), "{text}");
+    assert!(text.contains("signature"), "{text}");
 }
 
 #[test]
@@ -112,19 +161,21 @@ fn unknown_tool_and_method() {
 fn kv_state_within_session() {
     let mut m = Mcp::spawn();
     let _ = m.request("initialize", serde_json::json!({}));
+    let g = grant("t", &["kv.write"]);
     let put = m.request(
         "tools/call",
         serde_json::json!({
             "name": "kv-store.put",
-            "arguments": {"key": "k", "value": "v", "caller": "t", "capabilities": ["kv.write"]},
+            "arguments": {"key": "k", "value": "v", "caller": "t", "grant": g},
         }),
     );
     assert_eq!(put["result"]["isError"], serde_json::json!(false));
+    let g2 = grant("t", &[]);
     let get = m.request(
         "tools/call",
         serde_json::json!({
             "name": "kv-store.get",
-            "arguments": {"key": "k", "caller": "t"},
+            "arguments": {"key": "k", "caller": "t", "grant": g2},
         }),
     );
     let text = get["result"]["content"][0]["text"].as_str().unwrap();
