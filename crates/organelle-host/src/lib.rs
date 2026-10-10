@@ -9,12 +9,17 @@
 //! - org-010 content-addressed, hash-chained receipts (offline verifiable)
 //! - org-011 authority boundary enforcement (organelle -> organelle calls)
 //! - org-012 hot-swap organelle versions (pin / latest / split, rollback)
+//! - lifecycle: suspend / checkpoint / kill with receipted checkpoints.
 //!
 //! Design rules:
 //! - Every `call` emits exactly one receipt, including denials and rejections.
-//!   There is no silent pass.
-//! - The dispatch lock is never held across `handle()`: an organelle calling
-//!   back into the host cannot deadlock it.
+//!   There is no silent pass. Lifecycle actions are receipted too: suspend
+//!   emits a Suspend receipt plus a Checkpoint receipt carrying the sha256 of
+//!   the checkpoint bytes; kill is suspend-first and emits a Kill receipt as
+//!   the organelle's final receipt. There is no silent kill.
+//! - The dispatch lock is never held across `handle()` — or across the
+//!   lifecycle hooks `suspend()` / `kill()`: an organelle calling back into
+//!   the host cannot deadlock it.
 //! - `Host` is `Send + Sync` behind interior mutability so all four transport
 //!   surfaces can share one `Arc<Host>`.
 
@@ -100,6 +105,11 @@ pub trait HostRef: Send + Sync {
 }
 
 /// The organelle contract, mirroring `ToolOrganelle::handle`.
+///
+/// Lifecycle hooks are optional: both have default impls, so existing
+/// organelles keep compiling untouched. Stateful organelles override
+/// `suspend()` to serialize their state into the checkpoint bytes; the
+/// default is an ephemeral (empty) checkpoint.
 pub trait Organelle: Send + Sync {
     fn manifest(&self) -> OrganelleManifest;
     fn handle(
@@ -109,6 +119,33 @@ pub trait Organelle: Send + Sync {
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError>;
+
+    /// Quiesce and capture state. The host records the checkpoint bytes'
+    /// hash on a Checkpoint receipt. Default: ephemeral, nothing to save.
+    fn suspend(&self) -> Checkpoint {
+        Checkpoint {
+            codon: self.manifest().codon,
+            ts: utc_now_iso(),
+            bytes: Vec::new(),
+            ephemeral: true,
+        }
+    }
+
+    /// Release resources after suspend. Called by `Host::kill` between
+    /// the suspend/checkpoint receipts and the final Kill receipt.
+    /// Default: no-op.
+    fn kill(&self) {}
+}
+
+/// Serializable checkpoint captured by `Organelle::suspend`. `ephemeral`
+/// checkpoints carry no bytes; stateful organelles fill `bytes` with their
+/// serialized state (the host receipt holds the sha256 of `bytes`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub codon: String,
+    pub ts: String,
+    pub bytes: Vec<u8>,
+    pub ephemeral: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +174,9 @@ pub enum ReceiptKind {
     RouteChange,
     RouteRollback,
     Registration,
+    Suspend,
+    Checkpoint,
+    Kill,
 }
 
 /// One content-addressed, hash-chained receipt per host action.
@@ -470,6 +510,114 @@ impl Host {
             }
         };
         Ok((idx, &versions[idx]))
+    }
+
+    // -- suspend / checkpoint / kill (lifecycle) ---------------------------
+
+    /// Resolve a codon to its routed organelle (no lock held on return).
+    fn resolve_for_lifecycle(&self, codon: &str) -> Result<(Arc<dyn Organelle>, String), String> {
+        let inner = self.inner.read().unwrap();
+        match self.resolve_locked(&inner, codon, "t0000000000000000") {
+            Ok((_, e)) => Ok((e.organelle.clone(), e.manifest.version.clone())),
+            Err(reason) => Err(reason),
+        }
+    }
+
+    /// Emit a fail-closed lifecycle refusal receipt and return the error
+    /// string (carries the receipt id, like `CallError`).
+    fn lifecycle_denied(&self, kind: ReceiptKind, codon: &str, op: &str, reason: String) -> String {
+        let rid = self.emit_receipt(Self::receipt_shell(
+            kind,
+            codon,
+            op,
+            "-",
+            "host",
+            &serde_json::json!({"codon": codon}),
+            format!("denied:{reason}"),
+            CallVerdict::Denied,
+            Valence::Candidate,
+            Some(reason.clone()),
+        ));
+        format!("{reason} (receipt {rid})")
+    }
+
+    /// Suspend an organelle: quiesce it, capture its checkpoint, and receipt
+    /// both. Emits a `Suspend` receipt followed by a `Checkpoint` receipt
+    /// whose `output_hash` is the sha256 of the checkpoint bytes — so the
+    /// chain commits to the exact captured state. Returns the checkpoint.
+    ///
+    /// The organelle's `suspend()` hook runs outside the dispatch lock.
+    /// Unknown codon is fail-closed: error + denial receipt, no checkpoint.
+    pub fn suspend(&self, codon: &str) -> Result<Checkpoint, String> {
+        let (organelle, version) = match self.resolve_for_lifecycle(codon) {
+            Ok(v) => v,
+            Err(reason) => {
+                return Err(self.lifecycle_denied(ReceiptKind::Suspend, codon, "suspend", reason))
+            }
+        };
+        let checkpoint = organelle.suspend();
+        let checkpoint_hash = sha256_hex(&checkpoint.bytes);
+        self.emit_receipt(Self::receipt_shell(
+            ReceiptKind::Suspend,
+            codon,
+            "suspend",
+            &version,
+            "host",
+            &serde_json::json!({"codon": codon}),
+            checkpoint_hash.clone(),
+            CallVerdict::Ok,
+            Valence::Proven,
+            Some(format!(
+                "suspended {codon} (ephemeral: {})",
+                checkpoint.ephemeral
+            )),
+        ));
+        self.emit_receipt(Self::receipt_shell(
+            ReceiptKind::Checkpoint,
+            codon,
+            "checkpoint",
+            &version,
+            "host",
+            &serde_json::json!({"codon": codon}),
+            checkpoint_hash,
+            CallVerdict::Ok,
+            Valence::Proven,
+            Some(format!(
+                "checkpoint for {codon}: {} bytes, ephemeral: {}",
+                checkpoint.bytes.len(),
+                checkpoint.ephemeral
+            )),
+        ));
+        Ok(checkpoint)
+    }
+
+    /// Kill an organelle. Suspend-first: the checkpoint is captured before
+    /// anything is torn down, then the organelle's `kill()` hook runs, then
+    /// a `Kill` receipt is emitted as that organelle's final receipt. There
+    /// is no silent kill. Unknown codon fails cleanly with a denial receipt.
+    pub fn kill(&self, codon: &str) -> Result<(), String> {
+        let (organelle, version) = match self.resolve_for_lifecycle(codon) {
+            Ok(v) => v,
+            Err(reason) => {
+                return Err(self.lifecycle_denied(ReceiptKind::Kill, codon, "kill", reason))
+            }
+        };
+        // Suspend-first: never silent-kill. Propagate the suspend error.
+        let checkpoint = self.suspend(codon)?;
+        organelle.kill();
+        self.emit_receipt(Self::receipt_shell(
+            ReceiptKind::Kill,
+            codon,
+            "kill",
+            &version,
+            "host",
+            &serde_json::json!({"codon": codon}),
+            sha256_hex(&checkpoint.bytes),
+            CallVerdict::Ok,
+            Valence::Proven,
+            Some(format!("killed {codon}; final checkpoint {} bytes", checkpoint.bytes.len())),
+        ));
+        Ok(())
     }
 
     // -- the call path (fail-closed) --------------------------------------
@@ -1342,6 +1490,159 @@ mod tests {
             h2.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap()
         });
         t.join().unwrap();
+        assert!(h.verify_chain().is_ok());
+    }
+
+    // -- lifecycle: suspend / checkpoint / kill ---------------------------
+
+    /// Stateful organelle with overridden lifecycle hooks.
+    struct Counter {
+        manifest: OrganelleManifest,
+        count: std::sync::atomic::AtomicU64,
+        killed: std::sync::atomic::AtomicBool,
+    }
+
+    impl Organelle for Counter {
+        fn manifest(&self) -> OrganelleManifest {
+            self.manifest.clone()
+        }
+        fn handle(
+            &self,
+            _ctx: &CallContext,
+            _host: &dyn HostRef,
+            op: &str,
+            input: Value,
+        ) -> Result<Value, OrganelleError> {
+            match op {
+                "inc" => {
+                    let n = self
+                        .count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    Ok(serde_json::json!({"count": n, "input": input}))
+                }
+                _ => Err(OrganelleError::not_found(format!("no such op {op}"))),
+            }
+        }
+        fn suspend(&self) -> Checkpoint {
+            let n = self.count.load(std::sync::atomic::Ordering::SeqCst);
+            Checkpoint {
+                codon: self.manifest().codon,
+                ts: utc_now_iso(),
+                bytes: serde_json::to_vec(&serde_json::json!({"count": n})).unwrap(),
+                ephemeral: false,
+            }
+        }
+        fn kill(&self) {
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn counter_host() -> (Arc<Host>, Arc<Counter>) {
+        let h = Host::new();
+        let mut m = test_manifest("ct", "1.0.0", vec![]);
+        m.contracts.push(Contract {
+            op: "inc".to_string(),
+            description: "increment counter".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            mutation_class: None,
+            required_capability: None,
+        });
+        let c = Arc::new(Counter {
+            manifest: m,
+            count: std::sync::atomic::AtomicU64::new(0),
+            killed: std::sync::atomic::AtomicBool::new(false),
+        });
+        h.register(c.clone()).unwrap();
+        (h, c)
+    }
+
+    #[test]
+    fn suspend_captures_checkpoint_and_receipts_it() {
+        let (h, _) = counter_host();
+        // Mutate state so the checkpoint is non-trivial.
+        for _ in 0..3 {
+            h.call(&ctx(), "ct", "inc", serde_json::json!({})).unwrap();
+        }
+        let before = h.receipts().len();
+        let cp = h.suspend("ct").unwrap();
+        // Checkpoint bytes round-trip: state survives serialization.
+        assert!(!cp.ephemeral);
+        let body: Value = serde_json::from_slice(&cp.bytes).unwrap();
+        assert_eq!(body["count"], serde_json::json!(3));
+        assert_eq!(cp.codon, "ct");
+        // Exactly 2 receipts: Suspend then Checkpoint.
+        let new = &h.receipts()[before..];
+        assert_eq!(new.len(), 2);
+        assert_eq!(new[0].kind, ReceiptKind::Suspend);
+        assert_eq!(new[0].verdict, CallVerdict::Ok);
+        assert_eq!(new[1].kind, ReceiptKind::Checkpoint);
+        // Checkpoint receipt commits to the exact checkpoint bytes.
+        assert_eq!(new[1].output_hash, sha256_hex(&cp.bytes));
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn kill_is_suspend_first_with_final_kill_receipt() {
+        let (h, c) = counter_host();
+        let _ = h.call(&ctx(), "ct", "inc", serde_json::json!({})).unwrap();
+        let before = h.receipts().len();
+        h.kill("ct").unwrap();
+        // The organelle's kill hook ran (not a silent host-side teardown).
+        assert!(c.killed.load(std::sync::atomic::Ordering::SeqCst));
+        // 3 receipts: Suspend, Checkpoint (from the suspend-first), Kill last.
+        let new = &h.receipts()[before..];
+        assert_eq!(new.len(), 3);
+        assert_eq!(new[0].kind, ReceiptKind::Suspend);
+        assert_eq!(new[1].kind, ReceiptKind::Checkpoint);
+        assert_eq!(new[2].kind, ReceiptKind::Kill);
+        assert_eq!(new[2].verdict, CallVerdict::Ok);
+        assert_eq!(new[2].codon, "ct");
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn kill_unknown_codon_errors_cleanly_with_receipt() {
+        let h = echo_host();
+        let before = h.receipts().len();
+        let e = h.kill("zz").unwrap_err();
+        assert!(e.contains("unknown organelle codon"), "got: {e}");
+        assert!(e.contains("receipt"), "error must carry the receipt id: {e}");
+        // Fail-closed: exactly one denial receipt, chain still green.
+        let new = &h.receipts()[before..];
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].kind, ReceiptKind::Kill);
+        assert_eq!(new[0].verdict, CallVerdict::Denied);
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn suspend_unknown_codon_errors_cleanly_with_receipt() {
+        let h = echo_host();
+        let before = h.receipts().len();
+        let e = h.suspend("zz").unwrap_err();
+        assert!(e.contains("unknown organelle codon"), "got: {e}");
+        assert!(e.contains("receipt"), "error must carry the receipt id: {e}");
+        let new = &h.receipts()[before..];
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].kind, ReceiptKind::Suspend);
+        assert_eq!(new[0].verdict, CallVerdict::Denied);
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn default_lifecycle_hooks_are_ephemeral_and_noop() {
+        // Echo overrides neither hook: existing organelles compile untouched
+        // and suspend as ephemeral.
+        let h = echo_host();
+        let before = h.receipts().len();
+        let cp = h.suspend("te").unwrap();
+        assert!(cp.ephemeral);
+        assert!(cp.bytes.is_empty());
+        h.kill("te").unwrap(); // default kill(): no-op, still receipted
+        let new = &h.receipts()[before..];
+        assert_eq!(new.len(), 2 + 3); // suspend(2) + kill(3)
+        assert_eq!(new[4].kind, ReceiptKind::Kill);
         assert!(h.verify_chain().is_ok());
     }
 }
