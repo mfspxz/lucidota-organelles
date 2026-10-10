@@ -1,0 +1,11 @@
+[package]
+name = "qa-manifest-check"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+organelle-manifest = { path = "../../../crates/organelle-manifest" }
+serde_json = "1"
+walkdir = "2"

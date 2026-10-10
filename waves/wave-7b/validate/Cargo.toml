@@ -1,0 +1,10 @@
+[package]
+name = "wave-7b-validate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+organelle-manifest = { path = "../../crates/organelle-manifest" }
+serde_json = "1"
+
+[workspace]
