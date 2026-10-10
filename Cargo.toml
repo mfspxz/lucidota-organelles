@@ -19,6 +19,7 @@ members = [
     "crates/surface-mcp",
     "crates/surface-rest",
     "crates/organelle-equivalence",
+    "crates/claim-reconciler",
 ]
 resolver = "2"
 

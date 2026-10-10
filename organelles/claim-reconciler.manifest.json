@@ -1,0 +1,165 @@
+{
+  "authority": {
+    "declared_valence": "candidate",
+    "granted_capabilities": [],
+    "mutation_class": "write",
+    "required_capability": "claims.write"
+  },
+  "codon": "cr",
+  "contracts": [
+    {
+      "description": "record a fix claim; permanent ID FC-<n> assigned when absent; scope locked to INSTANCE_ONLY",
+      "input_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "claim_id": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "fix_evidence": {
+            "type": "array"
+          },
+          "proof_script_path": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "store_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "store_path",
+          "fix_evidence",
+          "proof_script_path",
+          "commit"
+        ],
+        "type": "object"
+      },
+      "mutation_class": "write",
+      "op": "ingest-claim",
+      "required_capability": "claims.write"
+    },
+    {
+      "description": "record a defect; when it reproduces a claimed-fixed behavior, append a SUPERSEDED_BY_BYPASS linkage preserving the original receipt",
+      "input_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "defeating_probe": {
+            "type": "object"
+          },
+          "defeats_claim_id": {
+            "type": "string"
+          },
+          "defect_id": {
+            "type": "string"
+          },
+          "links": {
+            "type": "array"
+          },
+          "reproduces_fixed_behavior": {
+            "type": "boolean"
+          },
+          "store_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "store_path",
+          "defect_id"
+        ],
+        "type": "object"
+      },
+      "mutation_class": "write",
+      "op": "ingest-defect",
+      "required_capability": "claims.write"
+    },
+    {
+      "description": "current status of a claim (INSTANCE_ONLY / CLASS_CLOSED / SUPERSEDED_BY_BYPASS) with full event history",
+      "input_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "claim_id": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "object"
+          },
+          "store_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "store_path",
+          "claim_id"
+        ],
+        "type": "object"
+      },
+      "mutation_class": "read_only",
+      "op": "claim-status"
+    },
+    {
+      "description": "request class closure for a claim; granted only with all four evidence pieces and independent review that is not a reproducer replay; refused otherwise",
+      "input_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "claim_id": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "object"
+          },
+          "store_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "store_path",
+          "claim_id"
+        ],
+        "type": "object"
+      },
+      "mutation_class": "write",
+      "op": "request-class-closure",
+      "required_capability": "claims.class_close"
+    },
+    {
+      "description": "recompute the event-store hash chain; reports ok or the first breaking seq",
+      "input_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "store_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "store_path"
+        ],
+        "type": "object"
+      },
+      "mutation_class": "read_only",
+      "op": "verify"
+    }
+  ],
+  "description": "claim-defeat reconciliation: permanent claim IDs, instance-only default scope, gated class closure, bypass-linked supersede preserving the original receipt, append-only hash-chained event store",
+  "name": "claim-reconciler",
+  "receipt_policy": {
+    "algorithm": "sha256",
+    "chain": true,
+    "content_addressed": true
+  },
+  "schema_version": "1",
+  "transports": [
+    "native",
+    "unix_socket",
+    "mcp",
+    "rest"
+  ],
+  "version": "1.0.0"
+}
