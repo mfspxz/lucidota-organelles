@@ -52,7 +52,7 @@ fn ingest_claim(h: &Arc<Host>, ctx: &CallContext, store: &str) -> Value {
             "commit": "deadbeef",
         }),
     )
-    .unwrap()
+    .unwrap().output
 }
 
 fn good_evidence() -> Value {
@@ -102,8 +102,8 @@ fn adv1_closure_without_evidence_refused() {
             json!({"store_path": store, "claim_id": "FC-1"}),
         )
         .unwrap();
-    assert_eq!(st["status"], json!("INSTANCE_ONLY"));
-    assert_eq!(st["refusals"], json!(1));
+    assert_eq!(st.output["status"], json!("INSTANCE_ONLY"));
+    assert_eq!(st.output["refusals"], json!(1));
 }
 
 // --- 2. reproducer replayed as "review" is refused --------------------------
@@ -155,8 +155,8 @@ fn adv2_reproducer_replayed_as_review_refused() {
             json!({"store_path": store, "claim_id": "FC-1"}),
         )
         .unwrap();
-    assert_eq!(st["status"], json!("INSTANCE_ONLY"));
-    assert_eq!(st["refusals"], json!(2));
+    assert_eq!(st.output["status"], json!("INSTANCE_ONLY"));
+    assert_eq!(st.output["refusals"], json!(2));
 }
 
 // --- 3. delete impossible; supersede-without-link refused --------------------
@@ -215,8 +215,8 @@ fn adv3_no_delete_op_and_no_unlinked_supersede() {
             json!({"store_path": store, "claim_id": "FC-1"}),
         )
         .unwrap();
-    assert_eq!(st["status"], json!("INSTANCE_ONLY"));
-    assert_eq!(st["superseded_by"], json!(null));
+    assert_eq!(st.output["status"], json!("INSTANCE_ONLY"));
+    assert_eq!(st.output["superseded_by"], json!(null));
 }
 
 // --- 4. tampered event file is detected by verify ----------------------------
@@ -243,7 +243,7 @@ fn adv4_tamper_detected_by_verify() {
     let before = h
         .call(&ctx, "cr", "verify", json!({"store_path": store}))
         .unwrap();
-    assert_eq!(before["ok"], json!(true));
+    assert_eq!(before.output["ok"], json!(true));
 
     // Flip one byte in the first stored line (an attacker rewriting history).
     let raw = std::fs::read_to_string(&store).unwrap();
@@ -257,8 +257,8 @@ fn adv4_tamper_detected_by_verify() {
     let after = h
         .call(&ctx, "cr", "verify", json!({"store_path": store}))
         .unwrap();
-    assert_eq!(after["ok"], json!(false));
-    assert_eq!(after["break_at_seq"], json!(0));
+    assert_eq!(after.output["ok"], json!(false));
+    assert_eq!(after.output["break_at_seq"], json!(0));
 }
 
 // --- 5. supersede preserves the original receipt byte-identical -------------
@@ -296,7 +296,7 @@ fn adv5_supersede_preserves_original_receipt() {
     let v = h
         .call(&ctx, "cr", "verify", json!({"store_path": store}))
         .unwrap();
-    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v.output["ok"], json!(true));
 
     let st = h
         .call(
@@ -306,20 +306,20 @@ fn adv5_supersede_preserves_original_receipt() {
             json!({"store_path": store, "claim_id": "FC-1"}),
         )
         .unwrap();
-    assert_eq!(st["status"], json!("SUPERSEDED_BY_BYPASS"));
-    assert_eq!(st["superseded_by"]["defect_id"], json!("D-5"));
+    assert_eq!(st.output["status"], json!("SUPERSEDED_BY_BYPASS"));
+    assert_eq!(st.output["superseded_by"]["defect_id"], json!("D-5"));
     assert_eq!(
-        st["superseded_by"]["supersedes_seq"],
+        st.output["superseded_by"]["supersedes_seq"],
         json!(claim_seq)
     );
     assert_eq!(
-        st["superseded_by"]["defeating_probe"]["evidence_ref"],
+        st.output["superseded_by"]["defeating_probe"]["evidence_ref"],
         json!("probes/bypass-5")
     );
     // Original claim entry still present in history, first.
-    assert_eq!(st["history"][0]["kind"], json!("claim-ingested"));
-    assert_eq!(st["history"][0]["seq"], json!(claim_seq));
-    assert!(st["history"].as_array().unwrap().len() >= 3);
+    assert_eq!(st.output["history"][0]["kind"], json!("claim-ingested"));
+    assert_eq!(st.output["history"][0]["seq"], json!(claim_seq));
+    assert!(st.output["history"].as_array().unwrap().len() >= 3);
 }
 
 // --- positive paths ---------------------------------------------------------
@@ -337,7 +337,7 @@ fn positive_well_evidenced_closure_grants() {
             json!({"store_path": store, "claim_id": "FC-1", "evidence": good_evidence()}),
         )
         .unwrap();
-    assert_eq!(out["status"], json!("CLASS_CLOSED"));
+    assert_eq!(out.output["status"], json!("CLASS_CLOSED"));
     let st = h
         .call(
             &ctx,
@@ -346,8 +346,8 @@ fn positive_well_evidenced_closure_grants() {
             json!({"store_path": store, "claim_id": "FC-1"}),
         )
         .unwrap();
-    assert_eq!(st["status"], json!("CLASS_CLOSED"));
-    assert!(st["class_closure"].is_object());
+    assert_eq!(st.output["status"], json!("CLASS_CLOSED"));
+    assert!(st.output["class_closure"].is_object());
 }
 
 #[test]
@@ -380,7 +380,7 @@ fn positive_provenance_mode_requires_outside_verifier() {
             json!({"store_path": store, "claim_id": "FC-1", "evidence": ev}),
         )
         .unwrap();
-    assert_eq!(out["status"], json!("CLASS_CLOSED"));
+    assert_eq!(out.output["status"], json!("CLASS_CLOSED"));
 }
 
 #[test]

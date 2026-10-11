@@ -841,10 +841,10 @@ mod tests {
         let store = tmp_store("ids");
         let (h, ctx) = host_with_caps(&["claims.write"]);
         let r1 = h.call(&ctx, "cr", "ingest-claim", claim_input(&store)).unwrap();
-        assert_eq!(r1["claim_id"], json!("FC-1"));
+        assert_eq!(r1.output["claim_id"], json!("FC-1"));
         let r2 = h.call(&ctx, "cr", "ingest-claim", claim_input(&store)).unwrap();
-        assert_eq!(r2["claim_id"], json!("FC-2"));
-        assert_eq!(r2["scope"], json!("INSTANCE_ONLY"));
+        assert_eq!(r2.output["claim_id"], json!("FC-2"));
+        assert_eq!(r2.output["scope"], json!("INSTANCE_ONLY"));
         // Default scope is instance-only even when a scope field is omitted.
         let st = h
             .call(
@@ -854,7 +854,7 @@ mod tests {
                 json!({"store_path": store, "claim_id": "FC-1"}),
             )
             .unwrap();
-        assert_eq!(st["status"], json!("INSTANCE_ONLY"));
+        assert_eq!(st.output["status"], json!("INSTANCE_ONLY"));
     }
 
     #[test]
@@ -880,15 +880,15 @@ mod tests {
         let v0 = h
             .call(&ctx, "cr", "verify", json!({"store_path": store}))
             .unwrap();
-        assert_eq!(v0["ok"], json!(true));
-        assert_eq!(v0["entries"], json!(0));
+        assert_eq!(v0.output["ok"], json!(true));
+        assert_eq!(v0.output["entries"], json!(0));
         h.call(&ctx, "cr", "ingest-claim", claim_input(&store)).unwrap();
         let v1 = h
             .call(&ctx, "cr", "verify", json!({"store_path": store}))
             .unwrap();
-        assert_eq!(v1["ok"], json!(true));
-        assert_eq!(v1["entries"], json!(1));
-        assert_eq!(v1["head_hash"].as_str().unwrap().len(), 64);
+        assert_eq!(v1.output["ok"], json!(true));
+        assert_eq!(v1.output["entries"], json!(1));
+        assert_eq!(v1.output["head_hash"].as_str().unwrap().len(), 64);
     }
 
     #[test]
