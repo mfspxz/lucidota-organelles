@@ -1,3 +1,5 @@
+[Active R&D Lab] — no CI runs on record; active development, expect rough edges.
+
 # Organelles — parkwreck-organelle-host rebuild
 
 Scaffold slice **org-001 … org-024**, built 2026-10-07, Rust-first (Rust 1.99.0,
