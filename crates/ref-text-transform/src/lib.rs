@@ -107,6 +107,7 @@ mod tests {
         let ctx = CallContext::new("test", vec![]);
         h.call(&ctx, "tt", "transform", serde_json::json!({"text": text, "mode": mode}))
             .unwrap()
+            .output
     }
 
     #[test]

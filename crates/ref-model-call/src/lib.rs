@@ -141,7 +141,7 @@ mod tests {
         let ctx = CallContext::new("test", vec!["model.call".to_string()]);
         // Ensure stub mode regardless of ambient env.
         std::env::remove_var("MODEL_API_URL");
-        h.call(&ctx, "mc", "chat", serde_json::json!({"messages": messages})).unwrap()
+        h.call(&ctx, "mc", "chat", serde_json::json!({"messages": messages})).unwrap().output
     }
 
     #[test]
@@ -183,7 +183,8 @@ mod tests {
         let out = h
             .call(&ctx, "mc", "chat",
                 serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "model": "t"}))
-            .unwrap();
+            .unwrap()
+            .output;
         std::env::remove_var("MODEL_API_URL");
         assert_eq!(out["stub"], serde_json::json!(false));
         assert_eq!(out["reply"], serde_json::json!("live-reply"));

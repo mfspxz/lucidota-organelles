@@ -242,12 +242,15 @@ fn handle_conn(host: Arc<Host>, mut stream: TcpStream) {
             let op = body.get("op").and_then(|c| c.as_str()).unwrap_or("");
             let input = body.get("input").cloned().unwrap_or(Value::Null);
             match host.call_with_grant(grant, caller, organelle_manifest::Transport::Rest, codon, op, input) {
-                Ok(output) => {
-                    let receipt = host.receipts().last().map(|r| r.id.clone()).unwrap_or_default();
+                Ok(ok) => {
+                    // P1: the receipt id comes from the invocation result —
+                    // the exact receipt this invocation emitted — never from
+                    // a global "latest receipt" read (which cross-wires under
+                    // concurrency).
                     respond(
                         &mut stream,
                         200,
-                        &serde_json::json!({"ok": true, "output": output, "receipt": receipt}),
+                        &serde_json::json!({"ok": true, "output": ok.output, "receipt": ok.receipt_id}),
                     );
                 }
                 Err(e) => {
@@ -393,7 +396,14 @@ mod tests {
         assert!(status.contains("200"), "{status}");
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["output"]["result"], serde_json::json!("HI"));
-        assert!(!body["receipt"].as_str().unwrap().is_empty());
+        // P1: the returned receipt id is invocation-specific — it must name
+        // THIS call in the host store, not just be non-empty.
+        let rid = body["receipt"].as_str().unwrap();
+        assert!(!rid.is_empty());
+        let r = h.receipts().into_iter().find(|r| r.id == rid).expect("returned receipt id must resolve in store");
+        assert_eq!(r.caller, "t");
+        assert_eq!(r.codon, "tt");
+        assert_eq!(r.op, "transform");
         srv.shutdown();
     }
 
@@ -434,7 +444,14 @@ mod tests {
         assert!(status.contains("400"), "{status}");
         assert_eq!(body["ok"], serde_json::json!(false));
         assert_eq!(body["error"]["verdict"], serde_json::json!("Denied"));
-        assert!(!body["receipt"].as_str().unwrap().is_empty());
+        // P1: the denial's receipt id is invocation-specific too.
+        let rid = body["receipt"].as_str().unwrap();
+        assert!(!rid.is_empty());
+        let r = h.receipts().into_iter().find(|r| r.id == rid).expect("denial receipt id must resolve in store");
+        assert_eq!(format!("{:?}", r.verdict), "Denied");
+        assert_eq!(r.caller, "t");
+        assert_eq!(r.codon, "kv");
+        assert_eq!(r.op, "put");
         srv.shutdown();
     }
 

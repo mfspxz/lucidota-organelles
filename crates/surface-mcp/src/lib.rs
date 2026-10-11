@@ -115,11 +115,14 @@ pub fn dispatch(host: &Host, tools: &[McpTool], msg: &Value) -> Option<Value> {
                         obj.remove("capabilities");
                     }
                     match host.call_with_grant(&grant, caller_claim.as_deref(), organelle_manifest::Transport::Mcp, &tool.codon, &tool.op, input) {
-                        Ok(output) => rpc_result(
+                        // P1: the receipt id rides with the invocation
+                        // result — the exact receipt this call emitted.
+                        Ok(ok) => rpc_result(
                             &id,
                             serde_json::json!({
-                                "content": [{"type": "text", "text": organelle_manifest::canonical_json(&output)}],
+                                "content": [{"type": "text", "text": organelle_manifest::canonical_json(&ok.output)}],
                                 "isError": false,
+                                "receipt": ok.receipt_id,
                             }),
                         ),
                         Err(e) => rpc_result(

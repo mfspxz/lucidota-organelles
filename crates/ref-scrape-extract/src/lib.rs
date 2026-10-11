@@ -122,7 +122,8 @@ mod tests {
         let ctx = CallContext::new("test", vec!["net.fetch".to_string()]);
         let out = h
             .call(&ctx, "se", "extract", serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}))
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(out["title"], serde_json::json!("Fixture"));
         assert!(out["text"].as_str().unwrap().contains("Hello"), "{}", out["text"]);
         assert!(!out["text"].as_str().unwrap().contains("bad()"));

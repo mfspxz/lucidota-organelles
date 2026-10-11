@@ -252,6 +252,7 @@ impl TransportAdapter for NativeAdapter {
         let ctx = CallContext::new(caller, caps.to_vec());
         self.host
             .call(&ctx, codon, op, input)
+            .map(|ok| ok.output)
             .map_err(|e| format!("{:?}: {}", e.verdict, e.reason))
     }
 }

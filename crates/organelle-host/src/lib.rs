@@ -331,6 +331,21 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
+/// Successful invocation result: the organelle's output AND the exact
+/// receipt id emitted for THIS invocation.
+///
+/// P1 (invocation-specific receipts): the id is produced by the receipt
+/// emission at invocation time and travels out with the result, so
+/// callers (surfaces, integrators) never do a global "latest receipt"
+/// read to answer "which receipt was my invocation's". Under concurrency
+/// a global read can return another invocation's receipt; this id is
+/// bound to exactly the receipt this invocation's emission created.
+#[derive(Debug, Clone)]
+pub struct CallOk {
+    pub output: Value,
+    pub receipt_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // Routing (org-012 hot-swap)
 // ---------------------------------------------------------------------------
@@ -717,7 +732,7 @@ impl Host {
         codon: &str,
         op: &str,
         input: Value,
-    ) -> Result<Value, CallError> {
+    ) -> Result<CallOk, CallError> {
         self.call_with_gate2(ctx, codon, op, input, Some(Transport::Native))
     }
 
@@ -732,7 +747,7 @@ impl Host {
         op: &str,
         input: Value,
         arrival: Option<Transport>,
-    ) -> Result<Value, CallError> {
+    ) -> Result<CallOk, CallError> {
         // Phase 0+1, under one read lock: profile gate, single resolution,
         // binding established, authorization against the SAME resolution.
         // The lock is dropped before any handler runs.
@@ -825,7 +840,7 @@ impl Host {
         ctx: &CallContext,
         rc: ResolvedCall,
         input: Value,
-    ) -> Result<Value, CallError> {
+    ) -> Result<CallOk, CallError> {
         let binding = rc.binding.clone();
         let (verdict, output_hash, valence, note, result): (
             CallVerdict,
@@ -863,7 +878,7 @@ impl Host {
             note,
         ));
         match result {
-            Ok(output) => Ok(output),
+            Ok(output) => Ok(CallOk { output, receipt_id }),
             Err(mut e) => {
                 e.receipt_id = receipt_id;
                 Err(e)
@@ -932,7 +947,7 @@ impl Host {
         codon: &str,
         op: &str,
         input: Value,
-    ) -> Result<Value, CallError> {
+    ) -> Result<CallOk, CallError> {
         let caller_label = caller_claim.unwrap_or("unauthenticated");
         let verified = match self.verify_grant(grant) {
             Ok(v) => v,
@@ -1210,6 +1225,7 @@ impl Host {
         match gate {
             Gate2::Go { .. } => self
                 .invoke_resolved(&ctx, callee, input)
+                .map(|ok| ok.output)
                 .map_err(|e| OrganelleError::new("denied", e.reason)),
             Gate2::Stop { reason } => {
                 let rid = self.emit_receipt(Self::receipt_shell(
@@ -1620,14 +1636,17 @@ mod tests {
     fn call_ok_emits_receipt() {
         let h = echo_host();
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({"a": 1})).unwrap();
-        assert_eq!(out["tag"], serde_json::json!("v1"));
+        assert_eq!(out.output["tag"], serde_json::json!("v1"));
         let rs = h.receipts();
         assert_eq!(rs.len(), 2); // registration + invocation
         let r = rs.last().unwrap();
         assert_eq!(r.verdict, CallVerdict::Ok);
         assert_eq!(r.codon, "te");
-        assert_eq!(r.output_hash, hash_value(&out));
+        assert_eq!(r.output_hash, hash_value(&out.output));
         assert!(!r.id.is_empty());
+        // P1: the result carries the EXACT receipt id of this invocation —
+        // no global "latest receipt" read is needed or used.
+        assert_eq!(out.receipt_id, r.id);
     }
 
     #[test]
@@ -1659,7 +1678,7 @@ mod tests {
         assert!(e.reason.contains("te.write"));
         // With the capability it passes.
         let out = h.call(&ctx_with(&["te.write"]), "te", "sealed", serde_json::json!({})).unwrap();
-        assert_eq!(out["sealed"], serde_json::json!(true));
+        assert_eq!(out.output["sealed"], serde_json::json!(true));
     }
 
     // -- P0: call_with_grant — authority only from trusted grants --------
@@ -1676,7 +1695,7 @@ mod tests {
         let out = h
             .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .unwrap();
-        assert_eq!(out["sealed"], serde_json::json!(true));
+        assert_eq!(out.output["sealed"], serde_json::json!(true));
         // Grant without the capability -> denied by the host's authorize().
         let g2 = grant_ctx_caps(&h, "ext", &[]);
         let e = h
@@ -1852,7 +1871,7 @@ mod tests {
         h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
             .unwrap();
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
-        assert_eq!(out["tag"], serde_json::json!("v2"));
+        assert_eq!(out.output["tag"], serde_json::json!("v2"));
     }
 
     #[test]
@@ -1862,7 +1881,7 @@ mod tests {
             .unwrap();
         h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string())).unwrap();
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
-        assert_eq!(out["tag"], serde_json::json!("v1"));
+        assert_eq!(out.output["tag"], serde_json::json!("v1"));
     }
 
     #[test]
@@ -1873,12 +1892,12 @@ mod tests {
         h.set_route("te", RoutePolicy::Split { v2_percent: 0 }).unwrap();
         for _ in 0..5 {
             let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
-            assert_eq!(out["tag"], serde_json::json!("v1"));
+            assert_eq!(out.output["tag"], serde_json::json!("v1"));
         }
         h.set_route("te", RoutePolicy::Split { v2_percent: 100 }).unwrap();
         for _ in 0..5 {
             let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
-            assert_eq!(out["tag"], serde_json::json!("v2"));
+            assert_eq!(out.output["tag"], serde_json::json!("v2"));
         }
         assert!(h.set_route("te", RoutePolicy::Split { v2_percent: 101 }).is_err());
     }
@@ -1894,7 +1913,7 @@ mod tests {
         let dt = t0.elapsed();
         assert!(dt.as_secs() < 60, "rollback must be < 60s");
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
-        assert_eq!(out["tag"], serde_json::json!("v2")); // back to Latest
+        assert_eq!(out.output["tag"], serde_json::json!("v2")); // back to Latest
         assert!(h.receipts().iter().any(|r| r.kind == ReceiptKind::RouteRollback));
     }
 
@@ -1914,7 +1933,7 @@ mod tests {
         let out = h
             .call(&ctx_with(&[]), "ca", "relay", serde_json::json!({}))
             .unwrap();
-        assert_eq!(out["sealed"], serde_json::json!(true));
+        assert_eq!(out.output["sealed"], serde_json::json!(true));
         assert!(h.boundary_denials().is_empty());
     }
 
@@ -2194,7 +2213,7 @@ mod tests {
         h.register(Arc::new(caller("cb", vec!["te.v1cap".to_string()], "sk", "sealed")))
             .unwrap();
         let out = h.call(&ctx(), "cb", "relay", serde_json::json!({})).unwrap();
-        assert_eq!(out["sealed"], serde_json::json!(true));
+        assert_eq!(out.output["sealed"], serde_json::json!(true));
         assert!(h.boundary_denials().is_empty());
         let r = h
             .receipts()
@@ -2219,7 +2238,7 @@ mod tests {
             .unwrap();
         h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string())).unwrap();
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
-        assert_eq!(out["tag"], serde_json::json!("v1")); // executed v1
+        assert_eq!(out.output["tag"], serde_json::json!("v1")); // executed v1
         let r = h.receipts().last().unwrap().clone();
         assert_eq!(r.manifest_version, "1.0.0"); // authorized v1
         assert_eq!(r.transport, Some(Transport::Native));
@@ -2265,9 +2284,11 @@ mod tests {
         let out = h
             .call_with_grant(&g, Some("ext"), Transport::Rest, "ro", "echo", serde_json::json!({"a": 1}))
             .unwrap();
-        assert_eq!(out["tag"], serde_json::json!("r"));
+        assert_eq!(out.output["tag"], serde_json::json!("r"));
         let r = h.receipts().last().unwrap().clone();
         assert_eq!(r.verdict, CallVerdict::Ok);
+        // P1: invocation-specific receipt id rides with the result.
+        assert_eq!(out.receipt_id, r.id);
         assert_eq!(r.transport, Some(Transport::Rest));
         assert_eq!(r.manifest_version, "1.0.0");
         assert_eq!(r.caller, "ext");
@@ -2318,7 +2339,7 @@ mod tests {
         let out = h
             .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .unwrap();
-        assert_eq!(out["sealed"], serde_json::json!(true));
+        assert_eq!(out.output["sealed"], serde_json::json!(true));
         let r = h.receipts().last().unwrap().clone();
         assert_eq!(r.caller, "ext");
         assert_eq!(r.codon, "te");

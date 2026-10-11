@@ -106,6 +106,7 @@ mod tests {
         let ctx = CallContext::new("test", vec![]);
         h.call(&ctx, "jv", "validate", serde_json::json!({"value": value, "schema": schema}))
             .unwrap()
+            .output
     }
 
     #[test]

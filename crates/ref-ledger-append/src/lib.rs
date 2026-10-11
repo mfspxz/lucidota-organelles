@@ -115,9 +115,9 @@ mod tests {
         let out = h
             .call(&ctx, "la", "append", serde_json::json!({"entry": entry, "ledger_path": path}))
             .unwrap();
-        assert_eq!(out["ok"], serde_json::json!(true));
-        assert_eq!(out["created"], serde_json::json!(true));
-        assert_eq!(out["entry_hash"].as_str().unwrap().len(), 64);
+        assert_eq!(out.output["ok"], serde_json::json!(true));
+        assert_eq!(out.output["created"], serde_json::json!(true));
+        assert_eq!(out.output["entry_hash"].as_str().unwrap().len(), 64);
         // Canonical line on disk: keys sorted.
         let disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(disk, "{\"a\":1,\"b\":2}\n");
@@ -125,7 +125,7 @@ mod tests {
         let out2 = h
             .call(&ctx, "la", "append", serde_json::json!({"entry": {"x": 1}, "ledger_path": path}))
             .unwrap();
-        assert_eq!(out2["created"], serde_json::json!(false));
+        assert_eq!(out2.output["created"], serde_json::json!(false));
         let _ = std::fs::remove_file(&path);
     }
 

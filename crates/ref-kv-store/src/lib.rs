@@ -141,11 +141,11 @@ mod tests {
     fn put_get_delete_roundtrip() {
         let (h, ctx) = host_with(true);
         h.call(&ctx, "kv", "put", serde_json::json!({"key": "a", "value": 1})).unwrap();
-        let got = h.call(&ctx, "kv", "get", serde_json::json!({"key": "a"})).unwrap();
+        let got = h.call(&ctx, "kv", "get", serde_json::json!({"key": "a"})).unwrap().output;
         assert_eq!(got["value"], serde_json::json!(1));
-        let del = h.call(&ctx, "kv", "delete", serde_json::json!({"key": "a"})).unwrap();
+        let del = h.call(&ctx, "kv", "delete", serde_json::json!({"key": "a"})).unwrap().output;
         assert_eq!(del["existed"], serde_json::json!(true));
-        let gone = h.call(&ctx, "kv", "get", serde_json::json!({"key": "a"})).unwrap();
+        let gone = h.call(&ctx, "kv", "get", serde_json::json!({"key": "a"})).unwrap().output;
         assert_eq!(gone["found"], serde_json::json!(false));
     }
 
@@ -154,7 +154,7 @@ mod tests {
         let (h, ctx) = host_with(false);
         let e = h.call(&ctx, "kv", "put", serde_json::json!({"key": "a", "value": 1})).unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Denied);
-        let list = h.call(&ctx, "kv", "list", serde_json::json!({})).unwrap();
+        let list = h.call(&ctx, "kv", "list", serde_json::json!({})).unwrap().output;
         assert_eq!(list["count"], serde_json::json!(0));
     }
 
@@ -164,7 +164,7 @@ mod tests {
         for k in ["c", "a", "b"] {
             h.call(&ctx, "kv", "put", serde_json::json!({"key": k, "value": true})).unwrap();
         }
-        let list = h.call(&ctx, "kv", "list", serde_json::json!({})).unwrap();
+        let list = h.call(&ctx, "kv", "list", serde_json::json!({})).unwrap().output;
         assert_eq!(list["keys"], serde_json::json!(["a", "b", "c"]));
     }
 

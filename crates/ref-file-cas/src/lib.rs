@@ -138,20 +138,21 @@ mod tests {
         let h = Host::new();
         h.register(organelle_with_dir(dir.clone())).unwrap();
         let ctx = CallContext::new("test", vec!["cas.write".to_string()]);
-        let put = h.call(&ctx, "fc", "put", serde_json::json!({"content": "hello cas"})).unwrap();
+        let put = h.call(&ctx, "fc", "put", serde_json::json!({"content": "hello cas"})).unwrap().output;
         let id = put["id"].as_str().unwrap().to_string();
         assert_eq!(id.len(), 64);
         // Same content -> same id (content addressing).
-        let put2 = h.call(&ctx, "fc", "put", serde_json::json!({"content": "hello cas"})).unwrap();
+        let put2 = h.call(&ctx, "fc", "put", serde_json::json!({"content": "hello cas"})).unwrap().output;
         assert_eq!(put2["id"], serde_json::json!(id));
         // get works without the write capability.
         let reader = CallContext::new("reader", vec![]);
-        let got = h.call(&reader, "fc", "get", serde_json::json!({"id": id})).unwrap();
+        let got = h.call(&reader, "fc", "get", serde_json::json!({"id": id})).unwrap().output;
         assert_eq!(got["found"], serde_json::json!(true));
         assert_eq!(got["content"], serde_json::json!("hello cas"));
         let missing = h
             .call(&reader, "fc", "get", serde_json::json!({"id": "0".repeat(64)}))
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(missing["found"], serde_json::json!(false));
         let _ = std::fs::remove_dir_all(&dir);
     }

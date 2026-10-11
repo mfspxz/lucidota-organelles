@@ -127,7 +127,8 @@ mod tests {
         let out = h
             .call(&ctx, "nt", "send",
                 serde_json::json!({"channel": "test", "title": "T", "body": "B"}))
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(out["queued"], serde_json::json!(true));
         assert!(out["outbox_path"].as_str().unwrap().starts_with(&outbox));
         assert!(std::path::Path::new(out["outbox_path"].as_str().unwrap()).exists());

@@ -119,7 +119,7 @@ mod tests {
         let h = Host::new();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
-        h.call(&ctx, "gp", op, input).unwrap()
+        h.call(&ctx, "gp", op, input).unwrap().output
     }
 
     #[test]

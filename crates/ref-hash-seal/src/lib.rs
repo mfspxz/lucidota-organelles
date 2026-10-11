@@ -110,18 +110,20 @@ mod tests {
     fn seal_then_verify() {
         let (h, ctx) = h();
         let data = serde_json::json!({"b": 2, "a": 1});
-        let sealed = h.call(&ctx, "hs", "seal", serde_json::json!({"data": data})).unwrap();
+        let sealed = h.call(&ctx, "hs", "seal", serde_json::json!({"data": data})).unwrap().output;
         let digest = sealed["sha256"].as_str().unwrap().to_string();
         assert_eq!(digest.len(), 64);
         // Canonical: key order must not matter.
         let reordered = serde_json::json!({"a": 1, "b": 2});
         let v = h
             .call(&ctx, "hs", "verify", serde_json::json!({"data": reordered, "sha256": digest}))
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(v["match"], serde_json::json!(true));
         let tampered = h
             .call(&ctx, "hs", "verify", serde_json::json!({"data": {"a": 1, "b": 3}, "sha256": digest}))
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(tampered["match"], serde_json::json!(false));
     }
 
@@ -130,7 +132,8 @@ mod tests {
         let (h, ctx) = h();
         let sealed = h
             .call(&ctx, "hs", "seal", serde_json::json!({"data": "abc"}))
-            .unwrap();
+            .unwrap()
+            .output;
         // sha256 of canonical JSON `"abc"` (with quotes).
         assert_eq!(
             sealed["sha256"],

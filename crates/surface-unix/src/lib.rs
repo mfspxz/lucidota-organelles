@@ -81,10 +81,11 @@ fn handle_conn(host: Arc<Host>, stream: UnixStream) {
                 // identity is bound to the grant's subject inside
                 // `call_with_grant`; a missing/invalid grant is denied.
                 match host.call_with_grant(&req.grant, Some(&req.caller), organelle_manifest::Transport::UnixSocket, &req.codon, &req.op, req.input) {
-                    Ok(output) => {
-                        let receipt = host.receipts().last().map(|r| r.id.clone()).unwrap_or_default();
-                        WireResponse { id: req.id, ok: true, output: Some(output), error: None, receipt }
-                    }
+                    // P1: the receipt id comes from the invocation result —
+                    // the exact receipt this invocation emitted — never from
+                    // a global "latest receipt" read (which cross-wires under
+                    // concurrency).
+                    Ok(ok) => WireResponse { id: req.id, ok: true, output: Some(ok.output), error: None, receipt: ok.receipt_id },
                     Err(e) => WireResponse {
                         id: req.id,
                         ok: false,
@@ -279,7 +280,7 @@ mod tests {
         let srv = spawn_server(h.clone(), &path).unwrap();
         let input = serde_json::json!({"text": "Parity", "mode": "slug"});
         let ctx = CallContext::new("test", vec![]);
-        let native = h.call(&ctx, "tt", "transform", input.clone()).unwrap();
+        let native = h.call(&ctx, "tt", "transform", input.clone()).unwrap().output;
         let via_socket = UnixClient::call(
             &path,
             &req(9, &h, "test", &[], "tt", "transform", input),
@@ -290,6 +291,70 @@ mod tests {
             organelle_manifest::canonical_json(&via_socket.output.unwrap())
         );
         srv.shutdown();
+    }
+
+    #[test]
+    fn concurrent_calls_receipts_correlate_on_wire() {
+        // P1: this surface answered "my invocation's receipt" with a global
+        // receipts().last() read, which cross-wires under concurrency.
+        // The receipt id now rides the invocation result; prove it on the
+        // wire: N threads, distinct callers/inputs, every returned receipt
+        // id must name exactly its own invocation in the host store.
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 20;
+        let h = host();
+        let baseline = h.receipts().len();
+        let path = tmp_sock("concurrent");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let h = h.clone();
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                let caller = format!("sock-caller-{t}");
+                let mut out = Vec::new();
+                for i in 0..PER_THREAD {
+                    let input = serde_json::json!({
+                        "text": format!("thread-{t}-call-{i}"),
+                        "mode": "upper",
+                    });
+                    let resp = UnixClient::call(
+                        &path,
+                        &req((t * 1000 + i) as u64, &h, &caller, &[], "tt", "transform", input.clone()),
+                    )
+                    .unwrap();
+                    assert!(resp.ok, "{resp:?}");
+                    assert_eq!(resp.output.unwrap()["result"], serde_json::json!(format!("THREAD-{t}-CALL-{i}")));
+                    out.push((caller.clone(), input, resp.receipt));
+                }
+                out
+            }));
+        }
+        let mut records = Vec::new();
+        for hh in handles {
+            records.extend(hh.join().unwrap());
+        }
+        assert_eq!(records.len(), THREADS * PER_THREAD);
+
+        // Every wire receipt id is unique and resolves to the stored
+        // receipt for exactly that invocation.
+        let mut seen = std::collections::HashSet::new();
+        let store: std::collections::HashMap<String, organelle_host::Receipt> =
+            h.receipts().into_iter().map(|r| (r.id.clone(), r)).collect();
+        assert_eq!(store.len() - baseline, THREADS * PER_THREAD);
+        for (caller, input, rid) in &records {
+            assert!(!rid.is_empty());
+            assert!(seen.insert(rid.clone()), "duplicate receipt id {rid}");
+            let r = store.get(rid).unwrap_or_else(|| panic!("receipt {rid} missing from store"));
+            assert_eq!(r.caller, *caller, "receipt {rid} caller");
+            assert_eq!(r.codon, "tt", "receipt {rid} codon");
+            assert_eq!(r.op, "transform", "receipt {rid} op");
+            assert_eq!(r.input_hash, organelle_manifest::hash_value(input), "receipt {rid} input_hash");
+        }
+        assert!(h.verify_chain().is_ok());
+        srv.shutdown();
+        assert!(!path.exists());
     }
 
     // -- P0 forged-capability tests: every forgery must be denied ---------

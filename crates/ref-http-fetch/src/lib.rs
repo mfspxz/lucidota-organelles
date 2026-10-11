@@ -114,6 +114,7 @@ mod tests {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["net.fetch".to_string()]);
         h.call(&ctx, "hf", "fetch", serde_json::json!({"url": url}))
+            .map(|ok| ok.output)
     }
 
     #[test]

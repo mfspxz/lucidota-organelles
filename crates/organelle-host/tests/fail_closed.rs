@@ -137,11 +137,11 @@ fn authorized_call_succeeds() {
     let out = h
         .call(&ctx(&["probe.armed"]), "pb", "armed", serde_json::json!({}))
         .unwrap();
-    assert_eq!(out["armed"], serde_json::json!(true));
+    assert_eq!(out.output["armed"], serde_json::json!(true));
     let out2 = h
         .call(&ctx(&[]), "pb", "ping", serde_json::json!({"nonce": "n1"}))
         .unwrap();
-    assert_eq!(out2["pong"], serde_json::json!("n1"));
+    assert_eq!(out2.output["pong"], serde_json::json!("n1"));
 }
 
 #[test]
