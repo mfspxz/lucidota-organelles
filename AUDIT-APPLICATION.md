@@ -39,6 +39,16 @@ empty OOB record would be ritual; instead this documents the N/A.
 If receipts are ever persisted to disk, an OOB head copy becomes
 mandatory before any tamper-evidence claim (R-3).
 
+**P2 update (2026-10-10):** receipts ARE now persisted
+(`organelle-host/src/receipt_log.rs`: append-only `ORL1`-framed log,
+fsync before the id returns, torn-tail truncation, corruption
+fails-closed) and the OOB head copy exists as `ReceiptAnchor`
+(`export_anchor` / `write_anchor` / `verify_against_anchor`). The honest
+bound moved accordingly: see `docs/VERIFIER.md` §§1–5 (what
+`verify_chain`, persistence, and anchors do and do not prove, and the
+residual trust assumptions). R-2's "process-integrity only" bound now
+applies only when the receipt log is NOT enabled.
+
 ### R-4 (backlog triage) — APPLIED
 Standing known issues in THIS repo's own tree:
 - `waves/` contains untracked QA-audit scratch (`qa-audit-1/RESULTS.md`,

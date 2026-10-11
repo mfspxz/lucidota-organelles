@@ -40,6 +40,8 @@ mod authority;
 pub use authority::{GrantError, GrantErrorKind, VerifiedGrant};
 mod policy;
 pub use policy::{EgressPolicy, HostPattern};
+mod receipt_log;
+pub use receipt_log::{ReceiptAnchor, RecoveryOutcome};
 
 // ---------------------------------------------------------------------------
 // Organelle trait (the protein side of the membrane)
@@ -413,6 +415,12 @@ struct HostInner {
     receipts: Vec<Receipt>,
     boundary_denials: Vec<BoundaryDenial>,
     receipt_seq: u64,
+    /// Durable receipt log (P2). `None` = persistence not enabled: the
+    /// chain is process-integrity only and dies with the process. When
+    /// `Some`, every emission is appended + fsync'd BEFORE the receipt id
+    /// is returned, so a returned id is always durable against process
+    /// crash (machine-crash safety is modulo the OS honoring fsync).
+    receipt_log: Option<receipt_log::ReceiptLog>,
     /// Sole issuer/verifier of capability grants (P0: unforgeable authority).
     authority: authority::GrantAuthority,
     /// Approved filesystem write roots, canonicalized at set time.
@@ -448,6 +456,7 @@ impl Host {
                 receipts: Vec::new(),
                 boundary_denials: Vec::new(),
                 receipt_seq: 0,
+                receipt_log: None,
                 authority,
                 write_roots: Vec::new(),
                 egress: EgressPolicy::deny_all(),
@@ -480,6 +489,23 @@ impl Host {
             .map(|p| p.id.clone())
             .unwrap_or_else(|| "GENESIS".to_string());
         r.id = r.compute_id();
+        // P2 durability: the record is appended AND fsync'd BEFORE the id
+        // is returned or the receipt enters the in-memory chain. A caller
+        // holding a receipt id therefore holds a durable record (process-
+        // crash safe; machine-crash modulo the OS honoring fsync).
+        //
+        // Fail-closed: if the log cannot be written, the audit trail is
+        // broken and the host must not keep serving. Panicking while the
+        // dispatch write-guard is held poisons the RwLock, so every later
+        // operation on this host fails instead of serving receipts that
+        // are not durable. Loud death beats silent audit loss.
+        if let Some(log) = inner.receipt_log.as_mut() {
+            if let Err(e) = log.append(&r) {
+                panic!(
+                    "receipt log append failed ({e}): refusing to serve without a durable audit trail"
+                );
+            }
+        }
         let id = r.id.clone();
         inner.receipts.push(r);
         id
@@ -544,6 +570,183 @@ impl Host {
 
     pub fn boundary_denials(&self) -> Vec<BoundaryDenial> {
         self.inner.read().unwrap().boundary_denials.clone()
+    }
+
+    // -- receipt persistence + recovery (P2) --------------------------------
+
+    /// Attach the durable receipt log at `raw` (a file path) and run
+    /// recovery. The path MUST resolve under an approved write root —
+    /// the P1 write-root policy is reused here, so with no roots
+    /// configured (default deny) or a path escaping every root this
+    /// fails closed and nothing is attached.
+    ///
+    /// Recovery outcomes:
+    /// - log empty + no in-memory receipts: fresh start.
+    /// - log empty + in-memory receipts: the in-memory chain is adopted
+    ///   (written out, fsync'd). Call this BEFORE registering organelles
+    ///   and there is nothing to adopt.
+    /// - log non-empty + no in-memory receipts: the chain is rebuilt from
+    ///   the log (torn crash tails truncated openly, corruption fails
+    ///   closed — the log is NOT attached).
+    /// - both non-empty: the chains must be identical, else fail-closed
+    ///   (two writers, or a foreign log — refusing to merge).
+    ///
+    /// Returns what recovery found. After this returns `Ok`, every
+    /// emission is fsync'd before its id is returned.
+    pub fn enable_receipt_log(&self, raw: &str) -> Result<RecoveryOutcome, String> {
+        let path = {
+            let inner = self.inner.read().unwrap();
+            policy::resolve_write_path(&inner.write_roots, raw)?
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("receipt log: cannot create parent dir: {e}"))?;
+        }
+        let (mut log, recovery) = receipt_log::ReceiptLog::open(&path)?;
+        {
+            let mut inner = self.inner.write().unwrap();
+            if inner.receipt_log.is_some() {
+                return Err("receipt log already enabled".to_string());
+            }
+            match (&recovery.receipts[..], &inner.receipts[..]) {
+                ([], []) => {
+                    inner.receipt_log = Some(log);
+                }
+                ([], mem) => {
+                    for r in mem {
+                        log.append(r).map_err(|e| {
+                            format!("receipt log adopt in-memory chain: {e}")
+                        })?;
+                    }
+                    inner.receipt_log = Some(log);
+                }
+                (disk, []) => {
+                    inner.receipt_seq =
+                        disk.iter().map(|r| r.seq).max().unwrap_or(0);
+                    inner.receipts = disk.to_vec();
+                    inner.receipt_log = Some(log);
+                }
+                (disk, mem) => {
+                    let same = disk.len() == mem.len()
+                        && disk.iter().zip(mem.iter()).all(|(a, b)| a.id == b.id);
+                    if !same {
+                        return Err(
+                            "receipt log chain does not match in-memory chain \
+                             (two writers sharing one log, or a foreign log): \
+                             refusing to attach"
+                                .to_string(),
+                        );
+                    }
+                    inner.receipt_seq =
+                        disk.iter().map(|r| r.seq).max().unwrap_or(0);
+                    inner.receipt_log = Some(log);
+                }
+            }
+        }
+        Ok(recovery.outcome)
+    }
+
+    /// Test hook: break the attached receipt log so the next emission's
+    /// append fails. The host must then refuse to serve (fail-closed)
+    /// instead of handing out receipt ids that are not durable.
+    #[doc(hidden)]
+    pub fn __test_break_receipt_log(&self) {
+        if let Some(log) = self.inner.write().unwrap().receipt_log.as_mut() {
+            log.__test_break();
+        }
+    }
+
+    /// Canonical path of the attached receipt log, if persistence is on.
+    pub fn receipt_log_path(&self) -> Option<PathBuf> {
+        self.inner
+            .read()
+            .unwrap()
+            .receipt_log
+            .as_ref()
+            .map(|l| l.path.clone())
+    }
+
+    // -- external checkpoints / anchors (P2) -------------------------------
+
+    /// Export an out-of-band checkpoint over the current chain head:
+    /// `(seq, head_id, count, ts)`. Publish the result somewhere the host
+    /// operator does NOT control (separate store, separate machine); the
+    /// anchor is only as trustworthy as its store's independence from the
+    /// host. See `verify_against_anchor` and docs/VERIFIER.md for exactly
+    /// what an anchor does and does not prove.
+    pub fn export_anchor(&self) -> Result<ReceiptAnchor, String> {
+        let inner = self.inner.read().unwrap();
+        let head = inner
+            .receipts
+            .last()
+            .ok_or_else(|| "no receipts to anchor".to_string())?;
+        Ok(ReceiptAnchor {
+            format: 1,
+            seq: head.seq,
+            head_id: head.id.clone(),
+            count: inner.receipts.len(),
+            ts: utc_now_iso(),
+        })
+    }
+
+    /// Export the anchor AND write it as JSON to `raw` (under an approved
+    /// write root — same P1 policy as the receipt log). The write is atomic
+    /// (tmp file + rename) and fsync'd. Returns the canonical path written.
+    pub fn write_anchor(&self, raw: &str) -> Result<PathBuf, String> {
+        let path = {
+            let inner = self.inner.read().unwrap();
+            policy::resolve_write_path(&inner.write_roots, raw)?
+        };
+        let anchor = self.export_anchor()?;
+        let bytes = serde_json::to_vec_pretty(&anchor)
+            .map_err(|e| format!("anchor serialize: {e}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("anchor: cannot create parent dir: {e}"))?;
+        }
+        let tmp = path.with_extension("anchor.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| format!("anchor write {}: {e}", tmp.display()))?;
+            f.write_all(&bytes)
+                .map_err(|e| format!("anchor write {}: {e}", tmp.display()))?;
+            f.sync_all()
+                .map_err(|e| format!("anchor fsync {}: {e}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("anchor rename {}: {e}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Check the live chain against a previously exported anchor. `Ok`
+    /// means the chain still contains the exact `(seq, head_id)` pair the
+    /// anchor pinned. `Err` means the chain was truncated/rewound below the
+    /// anchor, rewritten at the anchor point, or the anchor is from the
+    /// future (not present yet).
+    ///
+    /// Honest bound: this detects rewinds/rewrites of everything AT OR
+    /// BEFORE the anchor. It does NOT detect tail truncation AFTER the
+    /// anchor, forks that share the anchored prefix, or anything about
+    /// receipts newer than the anchor. Anchors must be exported often and
+    /// stored out of the operator's reach to mean anything.
+    pub fn verify_against_anchor(&self, anchor: &ReceiptAnchor) -> Result<(), String> {
+        let inner = self.inner.read().unwrap();
+        let r = inner.receipts.iter().find(|r| r.seq == anchor.seq);
+        match r {
+            None => Err(format!(
+                "anchor seq {} not present (chain head at seq {}): \
+                 chain was truncated/rewound below the anchor, or the anchor \
+                 is from the future",
+                anchor.seq, inner.receipt_seq
+            )),
+            Some(r) if r.id != anchor.head_id => Err(format!(
+                "anchor mismatch at seq {}: anchor pins {}, chain has {}: \
+                 chain was rewritten at or before the anchor",
+                anchor.seq, anchor.head_id, r.id
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     // -- registration ----------------------------------------------------
