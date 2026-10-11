@@ -79,14 +79,18 @@ impl Organelle for Notify {
     fn handle(
         &self,
         _ctx: &CallContext,
-        _host: &dyn HostRef,
+        host: &dyn HostRef,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
         if op != "send" {
             return Err(OrganelleError::not_found(format!("unknown op {op}")));
         }
-        std::fs::create_dir_all(&self.outbox)
+        // P1 lane 3: the outbox dir must sit under an approved write root.
+        // The filename is a content hash, so joining it onto the approved
+        // dir cannot escape.
+        let outbox = host.approve_write_path(&self.outbox)?;
+        std::fs::create_dir_all(&outbox)
             .map_err(|e| OrganelleError::failed(format!("outbox: {e}")))?;
         let envelope = serde_json::json!({
             "channel": input["channel"],
@@ -95,13 +99,13 @@ impl Organelle for Notify {
             "queued_at": organelle_manifest::utc_now_iso(),
         });
         let id = organelle_manifest::hash_value(&envelope);
-        let path = format!("{}/{id}.json", self.outbox);
+        let path = outbox.join(format!("{id}.json"));
         std::fs::write(&path, organelle_manifest::canonical_json(&envelope))
             .map_err(|e| OrganelleError::failed(format!("write: {e}")))?;
         Ok(serde_json::json!({
             "queued": true,
             "id": id,
-            "outbox_path": path,
+            "outbox_path": path.to_string_lossy(),
         }))
     }
 }
@@ -117,11 +121,19 @@ mod tests {
         p.to_string_lossy().into_owned()
     }
 
+    /// Host with write roots covering the process temp dir (P1 lane 3).
+    fn rooted_host() -> std::sync::Arc<Host> {
+        let h = Host::new();
+        h.set_write_roots(vec![std::env::temp_dir()])
+            .expect("temp dir must canonicalize");
+        h
+    }
+
     #[test]
     fn queues_to_outbox() {
         let outbox = tmp_outbox("ok");
         let _ = std::fs::remove_dir_all(&outbox);
-        let h = Host::new();
+        let h = rooted_host();
         h.register(organelle_with_outbox(outbox.clone())).unwrap();
         let ctx = CallContext::new("test", vec!["notify.send".to_string()]);
         let out = h
@@ -136,8 +148,31 @@ mod tests {
     }
 
     #[test]
-    fn without_capability_denied() {
+    fn outbox_outside_write_roots_denied() {
+        // Outbox dir outside the approved roots: send fails closed and
+        // queues nothing.
+        let mut root = std::env::temp_dir();
+        root.push(format!("organelle-nt-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
         let h = Host::new();
+        h.set_write_roots(vec![root.clone()]).unwrap();
+        let evil_outbox = tmp_outbox("outside");
+        h.register(organelle_with_outbox(evil_outbox.clone())).unwrap();
+        let ctx = CallContext::new("test", vec!["notify.send".to_string()]);
+        let e = h
+            .call(&ctx, "nt", "send",
+                serde_json::json!({"channel": "c", "title": "t", "body": "b"}))
+            .unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("denied"), "{}", e.reason);
+        assert!(!std::path::Path::new(&evil_outbox).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn without_capability_denied() {
+        let h = rooted_host();
         h.register(organelle_with_outbox(tmp_outbox("denied"))).unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h

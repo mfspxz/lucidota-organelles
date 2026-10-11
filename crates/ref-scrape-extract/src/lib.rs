@@ -1,7 +1,8 @@
 //! org-022 — Reference organelle: scrape-extract (codon `se`).
 //!
 //! Fetches an http:// page and extracts title, visible text, and links.
-//! ExternalEffect, requires `net.fetch`.
+//! ExternalEffect, requires `net.fetch`. Outbound egress is approved by the
+//! host against its allowlist (P1 lane 3): default-deny.
 
 use organelle_host::{CallContext, HostRef, Organelle, OrganelleError};
 use organelle_manifest::{
@@ -63,7 +64,7 @@ impl Organelle for ScrapeExtract {
     fn handle(
         &self,
         _ctx: &CallContext,
-        _host: &dyn HostRef,
+        host: &dyn HostRef,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
@@ -71,6 +72,8 @@ impl Organelle for ScrapeExtract {
             return Err(OrganelleError::not_found(format!("unknown op {op}")));
         }
         let url = input["url"].as_str().unwrap_or("");
+        // P1 lane 3: host egress policy gates the fetch (default deny).
+        host.approve_egress(url)?;
         let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(5000);
         let max_bytes = input["max_bytes"].as_u64().unwrap_or(1_048_576) as usize;
         let r = ref_common::http_get(url, timeout_ms, max_bytes)
@@ -114,20 +117,47 @@ mod tests {
         port
     }
 
+    fn extract_on(h: &std::sync::Arc<Host>, url: &str) -> Result<Value, organelle_host::CallError> {
+        h.register(organelle()).unwrap();
+        let ctx = CallContext::new("test", vec!["net.fetch".to_string()]);
+        h.call(&ctx, "se", "extract", serde_json::json!({"url": url}))
+            .map(|ok| ok.output)
+    }
+
     #[test]
     fn extract_local_page() {
         let port = serve_once();
         let h = Host::new();
-        h.register(organelle()).unwrap();
-        let ctx = CallContext::new("test", vec!["net.fetch".to_string()]);
-        let out = h
-            .call(&ctx, "se", "extract", serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}))
-            .unwrap()
-            .output;
+        h.set_egress_policy(
+            organelle_host::EgressPolicy::allowlist(&["127.0.0.1"]).unwrap(),
+        );
+        let out = extract_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap();
         assert_eq!(out["title"], serde_json::json!("Fixture"));
         assert!(out["text"].as_str().unwrap().contains("Hello"), "{}", out["text"]);
         assert!(!out["text"].as_str().unwrap().contains("bad()"));
         assert_eq!(out["links"], serde_json::json!(["/x"]));
+    }
+
+    #[test]
+    fn disallowed_host_denied() {
+        let port = serve_once();
+        let h = Host::new();
+        h.set_egress_policy(
+            organelle_host::EgressPolicy::allowlist(&["example.com"]).unwrap(),
+        );
+        let e = extract_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("egress denied"), "{}", e.reason);
+        assert!(!e.receipt_id.is_empty());
+    }
+
+    #[test]
+    fn no_policy_default_deny() {
+        let port = serve_once();
+        let h = Host::new();
+        let e = extract_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("egress denied"), "{}", e.reason);
     }
 
     #[test]

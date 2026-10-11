@@ -2,7 +2,9 @@
 //!
 //! Content-addressed file store: `put` stores bytes under their sha256 id,
 //! `get` retrieves by id. `put` is Write (`cas.write`); `get` is ReadOnly.
-//! Ids containing `..` or `/` are refused.
+//! Ids containing `..` or `/` are refused. The store directory itself is
+//! approved by the host against its write roots (P1 lane 3): `put` fails
+//! closed when the dir escapes the approved roots.
 
 use organelle_host::{CallContext, HostRef, Organelle, OrganelleError};
 use organelle_manifest::{
@@ -89,17 +91,21 @@ impl Organelle for FileCas {
     fn handle(
         &self,
         _ctx: &CallContext,
-        _host: &dyn HostRef,
+        host: &dyn HostRef,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| OrganelleError::failed(format!("cas dir: {e}")))?;
         match op {
             "put" => {
+                // P1 lane 3: the store dir must sit under an approved write
+                // root. The id is a validated 64-hex name, so joining it
+                // onto the approved dir cannot escape.
+                let dir = host.approve_write_path(&self.dir)?;
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| OrganelleError::failed(format!("cas dir: {e}")))?;
                 let content = input["content"].as_str().unwrap_or("");
                 let id = organelle_manifest::sha256_hex(content.as_bytes());
-                let path = format!("{}/{id}", self.dir);
+                let path = dir.join(&id);
                 std::fs::write(&path, content)
                     .map_err(|e| OrganelleError::failed(format!("write: {e}")))?;
                 Ok(serde_json::json!({"id": id, "bytes": content.len()}))
@@ -131,11 +137,19 @@ mod tests {
         p.to_string_lossy().into_owned()
     }
 
+    /// Host with write roots covering the process temp dir (P1 lane 3).
+    fn rooted_host() -> std::sync::Arc<Host> {
+        let h = Host::new();
+        h.set_write_roots(vec![std::env::temp_dir()])
+            .expect("temp dir must canonicalize");
+        h
+    }
+
     #[test]
     fn put_get_roundtrip() {
         let dir = tmp_dir("ok");
         let _ = std::fs::remove_dir_all(&dir);
-        let h = Host::new();
+        let h = rooted_host();
         h.register(organelle_with_dir(dir.clone())).unwrap();
         let ctx = CallContext::new("test", vec!["cas.write".to_string()]);
         let put = h.call(&ctx, "fc", "put", serde_json::json!({"content": "hello cas"})).unwrap().output;
@@ -158,9 +172,31 @@ mod tests {
     }
 
     #[test]
+    fn put_outside_write_roots_denied() {
+        // Store dir outside the approved roots: put fails closed and
+        // writes nothing.
+        let mut root = std::env::temp_dir();
+        root.push(format!("organelle-fc-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let h = Host::new();
+        h.set_write_roots(vec![root.clone()]).unwrap();
+        let evil_dir = tmp_dir("outside");
+        h.register(organelle_with_dir(evil_dir.clone())).unwrap();
+        let ctx = CallContext::new("test", vec!["cas.write".to_string()]);
+        let e = h
+            .call(&ctx, "fc", "put", serde_json::json!({"content": "nope"}))
+            .unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("denied"), "{}", e.reason);
+        assert!(!std::path::Path::new(&evil_dir).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn malformed_id_denied() {
         let dir = tmp_dir("bad");
-        let h = Host::new();
+        let h = rooted_host();
         h.register(organelle_with_dir(dir)).unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h.call(&ctx, "fc", "get", serde_json::json!({"id": "../evil"})).unwrap_err();

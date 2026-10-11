@@ -205,8 +205,28 @@ pub fn run_equivalence(
 
 /// Build a host with all 12 reference organelles. `outbox_dir` / `cas_dir`
 /// are shared across transports so file-backed outputs stay comparable.
+///
+/// P1 lane 3: the harness declares the side-effect policy every deployment
+/// needs — write roots covering the shared dirs (their parents; the ledger
+/// path is a sibling) and an egress allowlist for the fixture HTTP server
+/// (localhost only). Without these the membrane defaults to deny-all and
+/// the file/network scenarios fail closed, by design.
 pub fn build_host(outbox_dir: &str, cas_dir: &str) -> Arc<Host> {
     let h = Host::new();
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for d in [outbox_dir, cas_dir] {
+        if let Some(parent) = std::path::Path::new(d).parent() {
+            if !roots.contains(&parent.to_path_buf()) {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    h.set_write_roots(roots)
+        .expect("equivalence write roots must canonicalize");
+    h.set_egress_policy(
+        organelle_host::EgressPolicy::allowlist(&["127.0.0.1", "localhost"])
+            .expect("equivalence egress allowlist parses"),
+    );
     h.register(ref_kv_store::organelle()).unwrap();
     h.register(ref_http_fetch::organelle()).unwrap();
     h.register(ref_text_transform::organelle()).unwrap();

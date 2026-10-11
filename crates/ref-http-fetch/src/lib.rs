@@ -2,6 +2,8 @@
 //!
 //! Fetches an http:// URL (https honestly refused by the reference client).
 //! ExternalEffect, requires `net.fetch`. Body capped; truncation flagged.
+//! Outbound egress is approved by the host against its allowlist (P1 lane 3):
+//! default-deny, so a host with no egress policy refuses every fetch.
 
 use organelle_host::{CallContext, HostRef, Organelle, OrganelleError};
 use organelle_manifest::{
@@ -63,7 +65,7 @@ impl Organelle for HttpFetch {
     fn handle(
         &self,
         _ctx: &CallContext,
-        _host: &dyn HostRef,
+        host: &dyn HostRef,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
@@ -71,6 +73,9 @@ impl Organelle for HttpFetch {
             return Err(OrganelleError::not_found(format!("unknown op {op}")));
         }
         let url = input["url"].as_str().unwrap_or("");
+        // P1 lane 3: the host's egress allowlist is the policy. No policy
+        // (default deny) or a non-allowlisted host -> denied, no socket.
+        host.approve_egress(url)?;
         let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(5000);
         let max_bytes = input["max_bytes"].as_u64().unwrap_or(262_144) as usize;
         match ref_common::http_get(url, timeout_ms, max_bytes) {
@@ -109,8 +114,16 @@ mod tests {
         port
     }
 
-    fn fetch(url: &str) -> Result<Value, organelle_host::CallError> {
+    /// Host with an egress allowlist for the given hosts (P1 lane 3).
+    fn egress_host(allow: &[&str]) -> std::sync::Arc<Host> {
         let h = Host::new();
+        h.set_egress_policy(
+            organelle_host::EgressPolicy::allowlist(allow).expect("test allowlist parses"),
+        );
+        h
+    }
+
+    fn fetch_on(h: &std::sync::Arc<Host>, url: &str) -> Result<Value, organelle_host::CallError> {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["net.fetch".to_string()]);
         h.call(&ctx, "hf", "fetch", serde_json::json!({"url": url}))
@@ -120,15 +133,42 @@ mod tests {
     #[test]
     fn fetch_local_page() {
         let port = serve_once(b"<html><body>deterministic-fixture</body></html>");
-        let out = fetch(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let h = egress_host(&["127.0.0.1"]);
+        let out = fetch_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap();
         assert_eq!(out["status"], serde_json::json!(200));
         assert!(out["body"].as_str().unwrap().contains("deterministic-fixture"));
         assert_eq!(out["truncated"], serde_json::json!(false));
     }
 
     #[test]
+    fn disallowed_host_denied_before_socket() {
+        // Policy allows only example.com; 127.0.0.1 is denied by policy —
+        // the denial names the host, and no request is attempted.
+        let port = serve_once(b"unreachable");
+        let h = egress_host(&["example.com"]);
+        let e = fetch_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("egress denied"), "{}", e.reason);
+        assert!(e.reason.contains("127.0.0.1"), "{}", e.reason);
+        assert!(!e.receipt_id.is_empty());
+    }
+
+    #[test]
+    fn no_policy_default_deny() {
+        // No egress policy installed: every fetch is denied (default deny).
+        let port = serve_once(b"unreachable");
+        let h = Host::new();
+        let e = fetch_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("egress denied"), "{}", e.reason);
+    }
+
+    #[test]
     fn https_refused_honestly() {
-        let e = fetch("https://example.com/").unwrap_err();
+        // example.com passes the egress policy; the reference client still
+        // honestly refuses https (scheme enforcement is the transport's job).
+        let h = egress_host(&["example.com"]);
+        let e = fetch_on(&h, "https://example.com/").unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
         assert!(e.reason.contains("http://"), "{}", e.reason);
     }

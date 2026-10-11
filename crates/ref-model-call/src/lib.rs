@@ -3,7 +3,9 @@
 //! Calls an OpenAI-compatible chat endpoint when `MODEL_API_URL` is set;
 //! otherwise runs an honest deterministic stub (`stub: true` in the output,
 //! Candidate valence, and the reply is an echo — never presented as model
-//! output). ExternalEffect, requires `model.call`.
+//! output). ExternalEffect, requires `model.call`. The live path's egress
+//! is approved by the host against its allowlist (P1 lane 3): default-deny.
+//! The stub path performs no I/O and needs no egress approval.
 
 use organelle_host::{CallContext, HostRef, Organelle, OrganelleError};
 use organelle_manifest::{
@@ -87,7 +89,7 @@ impl Organelle for ModelCall {
     fn handle(
         &self,
         _ctx: &CallContext,
-        _host: &dyn HostRef,
+        host: &dyn HostRef,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
@@ -100,6 +102,9 @@ impl Organelle for ModelCall {
         match std::env::var("MODEL_API_URL") {
             Ok(base) if !base.trim().is_empty() => {
                 let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+                // P1 lane 3: the provider endpoint must pass the host's
+                // egress policy before any socket is opened.
+                host.approve_egress(&url)?;
                 let body = serde_json::json!({"model": model, "messages": messages});
                 match ref_common::http_post_json(&url, &body, 30_000, 1_048_576) {
                     Ok((status, v)) => {
@@ -178,6 +183,10 @@ mod tests {
         });
         std::env::set_var("MODEL_API_URL", format!("http://127.0.0.1:{port}"));
         let h = Host::new();
+        // P1 lane 3: the live provider path needs the endpoint allowlisted.
+        h.set_egress_policy(
+            organelle_host::EgressPolicy::allowlist(&["127.0.0.1"]).unwrap(),
+        );
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["model.call".to_string()]);
         let out = h

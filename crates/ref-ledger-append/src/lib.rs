@@ -1,8 +1,10 @@
 //! org-020 — Reference organelle: ledger-append (codon `la`).
 //!
 //! Appends a canonical-JSON line to a JSONL ledger file. Write, requires
-//! `ledger.write`. Paths containing `..` are refused (fail-closed on
-//! traversal, even though the capability gate is the primary control).
+//! `ledger.write`. The write path is approved by the host against its
+//! declared write roots (P1 lane 3): no roots configured = deny, `..`
+//! traversal and symlink escapes denied, and the organelle writes to the
+//! canonical path the host returns (never re-derived from raw input).
 
 use organelle_host::{CallContext, HostRef, Organelle, OrganelleError};
 use organelle_manifest::{
@@ -60,7 +62,7 @@ impl Organelle for LedgerAppend {
     fn handle(
         &self,
         _ctx: &CallContext,
-        _host: &dyn HostRef,
+        host: &dyn HostRef,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
@@ -68,16 +70,16 @@ impl Organelle for LedgerAppend {
             return Err(OrganelleError::not_found(format!("unknown op {op}")));
         }
         let path = input["ledger_path"].as_str().unwrap_or("");
-        if path.contains("..") {
-            return Err(OrganelleError::denied("ledger_path must not contain .."));
-        }
+        // P1 lane 3: the host's approved write roots are the policy. The
+        // returned canonical path is the one written — never re-derived.
+        let approved = host.approve_write_path(path)?;
         let line = organelle_manifest::canonical_json(&input["entry"]) + "\n";
         let entry_hash = organelle_manifest::sha256_hex(line.as_bytes());
-        let existed = std::path::Path::new(path).exists();
+        let existed = approved.exists();
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(&approved)
             .and_then(|mut f| {
                 use std::io::Write;
                 f.write_all(line.as_bytes())
@@ -85,7 +87,7 @@ impl Organelle for LedgerAppend {
             .map_err(|e| OrganelleError::failed(format!("append failed: {e}")))?;
         Ok(serde_json::json!({
             "ok": true,
-            "path": path,
+            "path": approved.to_string_lossy(),
             "bytes_written": line.len(),
             "entry_hash": entry_hash,
             "created": !existed,
@@ -104,11 +106,19 @@ mod tests {
         p.to_string_lossy().into_owned()
     }
 
+    /// Host with write roots covering the process temp dir (P1 lane 3).
+    fn rooted_host() -> std::sync::Arc<Host> {
+        let h = Host::new();
+        h.set_write_roots(vec![std::env::temp_dir()])
+            .expect("temp dir must canonicalize");
+        h
+    }
+
     #[test]
     fn append_roundtrip() {
         let path = tmp_path("ok");
         let _ = std::fs::remove_file(&path);
-        let h = Host::new();
+        let h = rooted_host();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
         let entry = serde_json::json!({"b": 2, "a": 1});
@@ -131,7 +141,7 @@ mod tests {
 
     #[test]
     fn traversal_refused() {
-        let h = Host::new();
+        let h = rooted_host();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
         let e = h
@@ -139,6 +149,77 @@ mod tests {
                 serde_json::json!({"entry": {}, "ledger_path": "/tmp/../evil.jsonl"}))
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains(".."), "{}", e.reason);
+    }
+
+    #[test]
+    fn write_outside_roots_denied_and_receipted() {
+        // Roots cover a scratch dir; the ledger path points elsewhere.
+        let mut root = std::env::temp_dir();
+        root.push(format!("organelle-la-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let h = Host::new();
+        h.set_write_roots(vec![root.clone()]).unwrap();
+        h.register(organelle()).unwrap();
+        let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
+        let outside = tmp_path("outside");
+        let e = h
+            .call(&ctx, "la", "append",
+                serde_json::json!({"entry": {"x": 1}, "ledger_path": outside}))
+            .unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("denied"), "{}", e.reason);
+        assert!(!e.receipt_id.is_empty());
+        // Fail-closed: nothing was written.
+        assert!(!std::path::Path::new(&outside).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_roots_default_deny() {
+        // A host with no write roots configured denies every write.
+        let h = Host::new();
+        h.register(organelle()).unwrap();
+        let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
+        let path = tmp_path("noroot");
+        let e = h
+            .call(&ctx, "la", "append",
+                serde_json::json!({"entry": {"x": 1}, "ledger_path": path}))
+            .unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("default deny"), "{}", e.reason);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn symlink_escape_denied() {
+        // root/link -> outside: writing through the symlink must be denied
+        // even though the lexical path sits under the root.
+        let mut root = std::env::temp_dir();
+        root.push(format!("organelle-la-symroot-{}", std::process::id()));
+        let mut outside = std::env::temp_dir();
+        outside.push(format!("organelle-la-symout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let h = Host::new();
+        h.set_write_roots(vec![root.clone()]).unwrap();
+        h.register(organelle()).unwrap();
+        let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
+        let via_link = root.join("link").join("evil.jsonl");
+        let e = h
+            .call(&ctx, "la", "append",
+                serde_json::json!({"entry": {"x": 1},
+                    "ledger_path": via_link.to_string_lossy()}))
+            .unwrap_err();
+        assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
+        assert!(e.reason.contains("denied"), "{}", e.reason);
+        assert!(!via_link.exists());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

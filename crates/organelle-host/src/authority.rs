@@ -52,6 +52,12 @@ struct GrantPayload {
     jti: String,
     /// When true, the grant is accepted exactly once.
     single_use: bool,
+    /// P1 lane 3 — audience: the codon of the ONE organelle this grant may
+    /// be presented to. `None` = unscoped (any codon; the pre-lane-3 shape).
+    /// `#[serde(default)]` keeps v1 tokens minted before this field existed
+    /// verifiable: a missing `aud` verifies as unscoped.
+    #[serde(default)]
+    aud: Option<String>,
 }
 
 /// What a verified grant confers on the presenter.
@@ -59,6 +65,10 @@ struct GrantPayload {
 pub struct VerifiedGrant {
     pub caller: String,
     pub capabilities: Vec<String>,
+    /// P1 lane 3 — audience this grant is confined to, if any. The host's
+    /// `call_with_grant` denies presenting a scoped grant to any other
+    /// codon: a grant issued for organelle A cannot invoke organelle B.
+    pub audience: Option<String>,
 }
 
 /// Why a grant was refused. Never carries the grant value itself
@@ -132,7 +142,14 @@ impl GrantAuthority {
         hex::encode(mac.finalize().into_bytes())
     }
 
-    fn mint(&self, sub: &str, caps: Vec<String>, ttl_secs: u64, single_use: bool) -> String {
+    fn mint(
+        &self,
+        sub: &str,
+        aud: Option<&str>,
+        caps: Vec<String>,
+        ttl_secs: u64,
+        single_use: bool,
+    ) -> String {
         let now = unix_now();
         let jti = hex::encode(random_bytes(16).expect("grant jti: /dev/urandom unavailable"));
         let payload = GrantPayload {
@@ -143,6 +160,7 @@ impl GrantAuthority {
             exp: now.saturating_add(ttl_secs),
             jti,
             single_use,
+            aud: aud.map(|a| a.to_string()),
         };
         let payload_hex = hex::encode(canonical_json(&serde_json::to_value(&payload).unwrap()));
         let tag = self.sign(&payload_hex);
@@ -152,13 +170,38 @@ impl GrantAuthority {
     /// Issue a multi-use grant: valid for `ttl_secs`, usable for any number
     /// of calls within that window.
     pub fn issue(&self, sub: &str, caps: Vec<String>, ttl_secs: u64) -> String {
-        self.mint(sub, caps, ttl_secs, false)
+        self.mint(sub, None, caps, ttl_secs, false)
     }
 
     /// Issue a single-use grant: the first presentation is honored, any
     /// replay is denied. For high-risk or exactly-once flows.
     pub fn issue_single_use(&self, sub: &str, caps: Vec<String>, ttl_secs: u64) -> String {
-        self.mint(sub, caps, ttl_secs, true)
+        self.mint(sub, None, caps, ttl_secs, true)
+    }
+
+    /// P1 lane 3 — issue a grant scoped (audience-bound) to ONE organelle
+    /// codon. Presenting it to any other codon is denied at the host, even
+    /// when the capability check would otherwise pass: the grant's domain
+    /// cannot escape its intended organelle.
+    pub fn issue_scoped(
+        &self,
+        sub: &str,
+        audience_codon: &str,
+        caps: Vec<String>,
+        ttl_secs: u64,
+    ) -> String {
+        self.mint(sub, Some(audience_codon), caps, ttl_secs, false)
+    }
+
+    /// Scoped + single-use: one presentation, to the one organelle.
+    pub fn issue_single_use_scoped(
+        &self,
+        sub: &str,
+        audience_codon: &str,
+        caps: Vec<String>,
+        ttl_secs: u64,
+    ) -> String {
+        self.mint(sub, Some(audience_codon), caps, ttl_secs, true)
     }
 
     /// Verify a grant token. On success returns what the presenter is
@@ -201,7 +244,11 @@ impl GrantAuthority {
             self.used.insert(payload.jti.clone(), payload.exp);
         }
 
-        Ok(VerifiedGrant { caller: payload.sub, capabilities: payload.caps })
+        Ok(VerifiedGrant {
+            caller: payload.sub,
+            capabilities: payload.caps,
+            audience: payload.aud,
+        })
     }
 }
 
@@ -279,6 +326,60 @@ mod tests {
         assert!(a.verify(&g).is_ok());
         let e = a.verify(&g).unwrap_err();
         assert_eq!(e.kind, GrantErrorKind::Replayed);
+    }
+
+    #[test]
+    fn scoped_grant_carries_audience() {
+        let mut a = GrantAuthority::new();
+        let g = a.issue_scoped("alice", "la", vec!["ledger.write".to_string()], 300);
+        let v = a.verify(&g).unwrap();
+        assert_eq!(v.caller, "alice");
+        assert_eq!(v.audience.as_deref(), Some("la"));
+        assert_eq!(v.capabilities, vec!["ledger.write".to_string()]);
+        // Unscoped grants verify with no audience (pre-lane-3 shape).
+        let g2 = a.issue("alice", vec!["ledger.write".to_string()], 300);
+        assert_eq!(a.verify(&g2).unwrap().audience, None);
+    }
+
+    #[test]
+    fn tampered_audience_denied() {
+        // Attacker takes a grant scoped to organelle A and re-points it at B.
+        let mut a = GrantAuthority::new();
+        let g = a.issue_scoped("alice", "la", vec!["ledger.write".to_string()], 300);
+        let (payload_hex, tag) = g.split_once('.').unwrap();
+        let mut payload: GrantPayload =
+            serde_json::from_slice(&hex::decode(payload_hex).unwrap()).unwrap();
+        payload.aud = Some("kv".to_string());
+        let forged = format!(
+            "{}.{}",
+            hex::encode(canonical_json(&serde_json::to_value(&payload).unwrap())),
+            tag
+        );
+        let e = a.verify(&forged).unwrap_err();
+        assert_eq!(e.kind, GrantErrorKind::InvalidSignature);
+    }
+
+    #[test]
+    fn pre_audience_token_still_verifies_as_unscoped() {
+        // A v1 token minted before `aud` existed (field absent, not null)
+        // must still verify, as unscoped. Hand-builds the old wire shape.
+        let a = GrantAuthority::new();
+        let now = organelle_manifest::unix_now();
+        let payload = serde_json::json!({
+            "v": 1,
+            "sub": "alice",
+            "caps": ["kv.read"],
+            "iat": now,
+            "exp": now + 300,
+            "jti": hex::encode(random_bytes(16).unwrap()),
+            "single_use": false,
+        });
+        let payload_hex = hex::encode(canonical_json(&payload));
+        let token = format!("{payload_hex}.{}", a.sign(&payload_hex));
+        let mut a = a;
+        let v = a.verify(&token).unwrap();
+        assert_eq!(v.caller, "alice");
+        assert_eq!(v.audience, None);
     }
 
     #[test]

@@ -30,6 +30,7 @@ use organelle_manifest::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, RwLock,
@@ -37,6 +38,8 @@ use std::sync::{
 
 mod authority;
 pub use authority::{GrantError, GrantErrorKind, VerifiedGrant};
+mod policy;
+pub use policy::{EgressPolicy, HostPattern};
 
 // ---------------------------------------------------------------------------
 // Organelle trait (the protein side of the membrane)
@@ -94,9 +97,12 @@ impl CallContext {
     }
 }
 
-/// What an organelle may ask of the host. Deliberately narrow: the only
-/// outward call is to another organelle, and it is authority-checked
-/// (org-011). This is the membrane's outbound channel.
+/// What an organelle may ask of the host. Deliberately narrow: the outward
+/// calls are (1) to another organelle, authority-checked (org-011), and
+/// (2) P1 lane 3 side-effect policy approvals — a filesystem write path or
+/// an outbound network egress. Organelles never decide these for
+/// themselves; the host answers from the deployment's declared policy.
+/// This is the membrane's outbound channel.
 ///
 /// `caller_trace` is the trace id of the invocation that is currently
 /// executing the caller: the host re-resolves the caller's *routed*
@@ -112,6 +118,20 @@ pub trait HostRef: Send + Sync {
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError>;
+
+    /// Ask the host to approve a filesystem write path. Returns the
+    /// canonical absolute path the organelle MUST write to — never re-derive
+    /// a path from the raw input after approval, which would reopen the
+    /// check/use gap. Denied when no write roots are configured (default
+    /// deny) or the resolved path escapes every approved root (`..` and
+    /// symlink escapes included).
+    fn approve_write_path(&self, raw: &str) -> Result<PathBuf, OrganelleError>;
+
+    /// Ask the host whether egress to `url` is allowed under the
+    /// deployment's outbound network policy. Default-deny: an empty
+    /// allowlist denies everything. The denial names only the URL's host,
+    /// never the full URL (query strings may carry secrets).
+    fn approve_egress(&self, url: &str) -> Result<(), OrganelleError>;
 }
 
 /// The organelle contract, mirroring `ToolOrganelle::handle`.
@@ -183,7 +203,10 @@ pub struct InvocationBinding {
     pub version: String,
     /// The capabilities this invocation is authorized with: from the
     /// verified grant (external surfaces), the caller's own context
-    /// (native surface), or the calling organelle's manifest (membrane).
+    /// (native surface), the calling organelle's manifest (membrane) — or,
+    /// for a nested call under a live grant (P1 lane 3), the intersection
+    /// of the manifest grants and the grant's capability domain, so the
+    /// grant cannot be escalated through the nested call.
     pub granted_capabilities: Vec<String>,
     /// Transport the invocation arrived over. `None` = internal membrane
     /// action (organelle->organelle, lifecycle, control-plane), which is
@@ -392,6 +415,19 @@ struct HostInner {
     receipt_seq: u64,
     /// Sole issuer/verifier of capability grants (P0: unforgeable authority).
     authority: authority::GrantAuthority,
+    /// Approved filesystem write roots, canonicalized at set time.
+    /// Empty = deny all writes (P1 lane 3, default deny).
+    write_roots: Vec<PathBuf>,
+    /// Outbound network policy. Default: deny all (P1 lane 3).
+    egress: EgressPolicy,
+    /// Live grant-confined invocations: trace_id -> the grant's capability
+    /// domain. A nested (organelle->organelle) call under one of these
+    /// traces may exercise at most the intersection of the calling
+    /// organelle's manifest grants and this domain — a grant for capability
+    /// X cannot be escalated to capability Y through a nested call (P1
+    /// lane 3). Trace ids are never reused, so an entry that leaks (panic
+    /// in a handler) cannot authorize any other invocation.
+    grant_domains: HashMap<String, Vec<String>>,
 }
 
 /// parkwreck-organelle-host. Share via `Arc<Host>`; all methods take `&self`.
@@ -413,6 +449,9 @@ impl Host {
                 boundary_denials: Vec::new(),
                 receipt_seq: 0,
                 authority,
+                write_roots: Vec::new(),
+                egress: EgressPolicy::deny_all(),
+                grant_domains: HashMap::new(),
             }),
         })
     }
@@ -921,6 +960,72 @@ impl Host {
             .issue_single_use(caller, capabilities, ttl_secs)
     }
 
+    /// Issue a grant scoped (audience-bound) to ONE organelle codon (P1
+    /// lane 3). Presenting it to any other codon is denied at the host —
+    /// the grant's domain cannot escape its intended organelle. Unscoped
+    /// grants from [`Host::issue_grant`] keep working (any codon).
+    pub fn issue_scoped_grant(
+        &self,
+        caller: &str,
+        codon: &str,
+        capabilities: Vec<String>,
+        ttl_secs: u64,
+    ) -> String {
+        self.inner
+            .read()
+            .unwrap()
+            .authority
+            .issue_scoped(caller, codon, capabilities, ttl_secs)
+    }
+
+    /// Scoped + single-use: one presentation, to the one organelle. For
+    /// high-risk or exactly-once flows confined to a single organelle.
+    pub fn issue_single_use_scoped_grant(
+        &self,
+        caller: &str,
+        codon: &str,
+        capabilities: Vec<String>,
+        ttl_secs: u64,
+    ) -> String {
+        self.inner
+            .read()
+            .unwrap()
+            .authority
+            .issue_single_use_scoped(caller, codon, capabilities, ttl_secs)
+    }
+
+    // -- side-effect containment policy (P1 lane 3) -------------------------
+
+    /// Declare the approved filesystem write roots. Each root is
+    /// canonicalized now (fail-closed: an unresolvable root refuses the
+    /// whole update, the previous policy stands). Until this is called
+    /// successfully, ALL organelle filesystem writes are denied
+    /// (default deny). The operator owns this list; organelles cannot
+    /// widen it.
+    pub fn set_write_roots(&self, roots: Vec<PathBuf>) -> Result<(), String> {
+        let mut canon = Vec::with_capacity(roots.len());
+        for r in &roots {
+            canon.push(r.canonicalize().map_err(|e| {
+                format!("write root {}: cannot canonicalize: {e}", r.display())
+            })?);
+        }
+        self.inner.write().unwrap().write_roots = canon;
+        Ok(())
+    }
+
+    /// The currently approved write roots (canonicalized). Empty =
+    /// default deny.
+    pub fn write_roots(&self) -> Vec<PathBuf> {
+        self.inner.read().unwrap().write_roots.clone()
+    }
+
+    /// Install the outbound network policy. The default (never installed)
+    /// is deny-all: organelles performing network egress fail closed until
+    /// the operator allowlists their hosts.
+    pub fn set_egress_policy(&self, policy: EgressPolicy) {
+        self.inner.write().unwrap().egress = policy;
+    }
+
     /// Verify a grant token (public so surfaces can pre-check; the call path
     /// below is the enforced entry point).
     pub fn verify_grant(&self, token: &str) -> Result<VerifiedGrant, GrantError> {
@@ -976,10 +1081,42 @@ impl Host {
                 ));
             }
         }
+        // P1 lane 3 — audience confinement: a grant scoped to organelle A
+        // cannot invoke organelle B, even when the capability check would
+        // otherwise pass. Unscoped grants (audience None) are unaffected.
+        if let Some(aud) = verified.audience.as_deref() {
+            if aud != codon {
+                return Err(self.grant_denied(
+                    caller_label,
+                    codon,
+                    op,
+                    &input,
+                    Some(transport),
+                    format!("grant scoped to organelle \"{aud}\": cannot invoke \"{codon}\""),
+                ));
+            }
+        }
         // Capabilities come ONLY from the trusted grant. Whatever the
         // caller claimed on the wire is not even read.
+        let grant_caps = verified.capabilities.clone();
         let ctx = CallContext::new(verified.caller, verified.capabilities);
-        self.call_with_gate2(&ctx, codon, op, input, Some(transport))
+        // P1 lane 3 — register the live grant domain: nested
+        // (organelle->organelle) calls under this invocation's trace are
+        // confined to the intersection of the calling organelle's manifest
+        // grants and these caps (see `call_as_organelle`). Removed when the
+        // invocation completes.
+        self.inner
+            .write()
+            .unwrap()
+            .grant_domains
+            .insert(ctx.trace_id.clone(), grant_caps);
+        let result = self.call_with_gate2(&ctx, codon, op, input, Some(transport));
+        self.inner
+            .write()
+            .unwrap()
+            .grant_domains
+            .remove(&ctx.trace_id);
+        result
     }
 
     /// Emit a fail-closed denial receipt for a grant failure and return the
@@ -1111,7 +1248,7 @@ impl Host {
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
-        let (caller_manifest, callee): (OrganelleManifest, ResolvedCall) = {
+        let (caller_manifest, callee, confined): (OrganelleManifest, ResolvedCall, bool) = {
             let inner = self.inner.read().unwrap();
             let caller_manifest = match self.resolve_locked(&inner, caller_codon, caller_trace) {
                 Ok((_, e)) => e.manifest.clone(),
@@ -1129,19 +1266,43 @@ impl Host {
                     )))
                 }
             };
+            // P1 lane 3 — grant-domain confinement for the nested call.
+            // When the outer invocation runs under a verified grant (its
+            // trace is live in `grant_domains`), the nested call's
+            // authority is the intersection of the calling organelle's
+            // manifest grants and the grant's capability domain: a grant
+            // for capability X cannot be escalated to capability Y through
+            // a nested call, even when the organelle's own manifest would
+            // allow Y. Invocations that did not arrive under a grant
+            // (native surface) keep the org-011 membrane identity model:
+            // the organelle's manifest grants govern, unchanged.
+            let outer_grant_caps = inner.grant_domains.get(caller_trace).cloned();
+            let manifest_grants = caller_manifest
+                .authority
+                .granted_capabilities
+                .clone();
+            let (effective_grants, confined) = match outer_grant_caps {
+                Some(gcaps) => (
+                    manifest_grants
+                        .into_iter()
+                        .filter(|c| gcaps.iter().any(|g| g == c))
+                        .collect::<Vec<_>>(),
+                    true,
+                ),
+                None => (manifest_grants, false),
+            };
             // The binding is established HERE, once, before the boundary
             // check: caller identity, callee id, resolved implementation
-            // version, and the caller's granted capabilities.
+            // version, and the caller's granted capabilities (the confined
+            // intersection when a grant domain is in force — the receipt
+            // then records exactly what authority the nested call ran with).
             let callee = ResolvedCall {
                 binding: InvocationBinding {
                     caller: format!("organelle:{caller_codon}"),
                     codon: codon.to_string(),
                     op: op.to_string(),
                     version: callee_entry.manifest.version.clone(),
-                    granted_capabilities: caller_manifest
-                        .authority
-                        .granted_capabilities
-                        .clone(),
+                    granted_capabilities: effective_grants,
                     // Membrane-internal: not a surface arrival, so no
                     // transport restriction applies (granted caps govern).
                     transport: None,
@@ -1149,7 +1310,7 @@ impl Host {
                 manifest: callee_entry.manifest.clone(),
                 organelle: callee_entry.organelle.clone(),
             };
-            (caller_manifest, callee)
+            (caller_manifest, callee, confined)
         };
         // Lock dropped before any handler runs: no registry lock is held
         // across the boundary check's receipt or the callee's handle().
@@ -1165,11 +1326,19 @@ impl Host {
                 .any(|c| c == need)
             {
                 let reason = format!(
-                    "organelle \"{caller_codon}\" ({}@{}) lacks granted capability \"{need}\" for {}@{}",
+                    "organelle \"{caller_codon}\" ({}@{}) lacks granted capability \"{need}\" for {}@{}{}",
                     caller_manifest.name,
                     caller_manifest.version,
                     callee.binding.codon,
                     callee.binding.version,
+                    // P1 lane 3: when the nested call was grant-confined,
+                    // say so — the organelle's manifest may hold the cap
+                    // while the live grant domain does not.
+                    if confined {
+                        " [grant-confined: outer grant domain excludes it]"
+                    } else {
+                        ""
+                    },
                 );
                 // Log the denial AND receipt it (no silent pass). The
                 // receipt carries the established binding: caller identity,
@@ -1223,10 +1392,36 @@ impl Host {
             }
         };
         match gate {
-            Gate2::Go { .. } => self
-                .invoke_resolved(&ctx, callee, input)
-                .map(|ok| ok.output)
-                .map_err(|e| OrganelleError::new("denied", e.reason)),
+            Gate2::Go { .. } => {
+                // P1 lane 3 — transitive confinement: when this nested call
+                // was grant-confined, its own trace carries the effective
+                // caps, so a further nested call from the callee is confined
+                // by the same grant domain. Non-confined (native-surface)
+                // chains are untouched: nothing is registered.
+                if confined {
+                    let trace = ctx.trace_id.clone();
+                    let caps = ctx.capabilities.clone();
+                    self.inner
+                        .write()
+                        .unwrap()
+                        .grant_domains
+                        .insert(trace.clone(), caps);
+                    let result = self
+                        .invoke_resolved(&ctx, callee, input)
+                        .map(|ok| ok.output)
+                        .map_err(|e| OrganelleError::new("denied", e.reason));
+                    self.inner
+                        .write()
+                        .unwrap()
+                        .grant_domains
+                        .remove(&trace);
+                    result
+                } else {
+                    self.invoke_resolved(&ctx, callee, input)
+                        .map(|ok| ok.output)
+                        .map_err(|e| OrganelleError::new("denied", e.reason))
+                }
+            }
             Gate2::Stop { reason } => {
                 let rid = self.emit_receipt(Self::receipt_shell(
                     ReceiptKind::Invocation,
@@ -1438,6 +1633,23 @@ impl HostRef for Host {
         input: Value,
     ) -> Result<Value, OrganelleError> {
         self.call_as_organelle(caller_codon, caller_trace, codon, op, input)
+    }
+
+    fn approve_write_path(&self, raw: &str) -> Result<PathBuf, OrganelleError> {
+        let roots = self.inner.read().unwrap().write_roots.clone();
+        policy::resolve_write_path(&roots, raw).map_err(OrganelleError::denied)
+    }
+
+    fn approve_egress(&self, url: &str) -> Result<(), OrganelleError> {
+        let host = policy::egress_host_of(url).map_err(OrganelleError::denied)?;
+        let allowed = self.inner.read().unwrap().egress.allows(&host);
+        if allowed {
+            Ok(())
+        } else {
+            Err(OrganelleError::denied(format!(
+                "egress denied: host \"{host}\" not in allowlist"
+            )))
+        }
     }
 }
 
