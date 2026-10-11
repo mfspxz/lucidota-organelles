@@ -8,7 +8,46 @@
   "codon": "cr",
   "contracts": [
     {
-      "description": "record a fix claim; permanent ID FC-<n> assigned when absent; scope locked to INSTANCE_ONLY",
+      "description": "bind a store path (host-approved under an operator write root) to an unforgeable grant token; mutating ops take the token, never a raw path",
+      "input_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "store_path": {
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "store_path"
+        ],
+        "type": "object"
+      },
+      "mutation_class": "write",
+      "op": "open-store",
+      "required_capability": "claims.write"
+    },
+    {
+      "description": "revoke a store grant token; the token is rejected afterwards",
+      "input_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "grant_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_token"
+        ],
+        "type": "object"
+      },
+      "mutation_class": "write",
+      "op": "close-store",
+      "required_capability": "claims.write"
+    },
+    {
+      "description": "record a fix claim; permanent ID FC-<n> assigned when absent; scope locked to INSTANCE_ONLY; provenance recorded_by the issuing grant",
       "input_schema": {
         "additionalProperties": true,
         "properties": {
@@ -24,18 +63,18 @@
           "fix_evidence": {
             "type": "array"
           },
+          "grant_token": {
+            "type": "string"
+          },
           "proof_script_path": {
             "type": "string"
           },
           "scope": {
             "type": "string"
-          },
-          "store_path": {
-            "type": "string"
           }
         },
         "required": [
-          "store_path",
+          "grant_token",
           "fix_evidence",
           "proof_script_path",
           "commit"
@@ -47,7 +86,7 @@
       "required_capability": "claims.write"
     },
     {
-      "description": "record a defect; when it reproduces a claimed-fixed behavior, append a SUPERSEDED_BY_BYPASS linkage preserving the original receipt",
+      "description": "record a defect; when it reproduces a claimed-fixed behavior, append a SUPERSEDED_BY_BYPASS linkage preserving the original receipt. The defeating probe must name a real artifact inside the grant-bound root whose sha256 matches payload_hash",
       "input_schema": {
         "additionalProperties": true,
         "properties": {
@@ -60,18 +99,18 @@
           "defect_id": {
             "type": "string"
           },
+          "grant_token": {
+            "type": "string"
+          },
           "links": {
             "type": "array"
           },
           "reproduces_fixed_behavior": {
             "type": "boolean"
-          },
-          "store_path": {
-            "type": "string"
           }
         },
         "required": [
-          "store_path",
+          "grant_token",
           "defect_id"
         ],
         "type": "object"
@@ -105,7 +144,7 @@
       "op": "claim-status"
     },
     {
-      "description": "request class closure for a claim; granted only with all four evidence pieces and independent review that is not a reproducer replay; refused otherwise",
+      "description": "request class closure for a claim; granted only with all four evidence pieces, independent review that is not a reproducer replay, and an attesting grant different from the recording grant (self-attestation refused)",
       "input_schema": {
         "additionalProperties": true,
         "properties": {
@@ -115,12 +154,12 @@
           "evidence": {
             "type": "object"
           },
-          "store_path": {
+          "grant_token": {
             "type": "string"
           }
         },
         "required": [
-          "store_path",
+          "grant_token",
           "claim_id"
         ],
         "type": "object"
@@ -130,7 +169,7 @@
       "required_capability": "claims.class_close"
     },
     {
-      "description": "recompute the event-store hash chain; reports ok or the first breaking seq",
+      "description": "recompute the event-store hash chain and provenance checks (probe artifacts resolvable + hash-matching; no self-attested closures); reports ok or the first breaking seq",
       "input_schema": {
         "additionalProperties": true,
         "properties": {
@@ -147,7 +186,7 @@
       "op": "verify"
     }
   ],
-  "description": "claim-defeat reconciliation: permanent claim IDs, instance-only default scope, gated class closure, bypass-linked supersede preserving the original receipt, append-only hash-chained event store",
+  "description": "claim-defeat reconciliation: grant-bound store handles, permanent claim IDs, instance-only default scope, gated class closure with self-attestation refusal, hash-resolvable defeating probes, bypass-linked supersede preserving the original receipt, append-only hash-chained event store",
   "name": "claim-reconciler",
   "receipt_policy": {
     "algorithm": "sha256",
@@ -161,5 +200,5 @@
     "mcp",
     "rest"
   ],
-  "version": "1.0.0"
+  "version": "1.1.0"
 }
