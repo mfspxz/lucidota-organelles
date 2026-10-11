@@ -446,13 +446,22 @@ fn verify_store(path: &str) -> Result<Value, OrganelleError> {
         // hash-matching probe artifact. No invented probes.
         if kind == KIND_CLAIM_SUPERSEDED {
             let probe = &e.entry["defeating_probe"];
-            // Pre-grant legacy entries carry no artifact_path and are
-            // exempt: they predate the resolvability rule.
-            if let Some(art) = probe["artifact_path"].as_str() {
-                let ph = probe["payload_hash"].as_str().unwrap_or("");
-                if let Err(reason) = check_probe_artifact(root, art, ph) {
+            // No legacy exemption (round-6 lane-6): a supersede entry
+            // without a resolvable, hash-matching artifact_path is
+            // indistinguishable from a direct-filesystem forgery — the
+            // event chain is keyless, so anyone with write access to the
+            // book can seal it. Fail closed.
+            match probe["artifact_path"].as_str() {
+                Some(art) => {
+                    let ph = probe["payload_hash"].as_str().unwrap_or("");
+                    if let Err(reason) = check_probe_artifact(root, art, ph) {
+                        return Ok(json!({"ok": false, "break_at_seq": e.seq,
+                            "reason": reason}));
+                    }
+                }
+                None => {
                     return Ok(json!({"ok": false, "break_at_seq": e.seq,
-                        "reason": reason}));
+                        "reason": "defeating probe has no artifact_path: supersede is unverifiable (no legacy exemption)"}));
                 }
             }
         }
