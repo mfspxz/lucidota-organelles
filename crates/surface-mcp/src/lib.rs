@@ -114,7 +114,7 @@ pub fn dispatch(host: &Host, tools: &[McpTool], msg: &Value) -> Option<Value> {
                         obj.remove("caller");
                         obj.remove("capabilities");
                     }
-                    match host.call_with_grant(&grant, caller_claim.as_deref(), &tool.codon, &tool.op, input) {
+                    match host.call_with_grant(&grant, caller_claim.as_deref(), organelle_manifest::Transport::Mcp, &tool.codon, &tool.op, input) {
                         Ok(output) => rpc_result(
                             &id,
                             serde_json::json!({

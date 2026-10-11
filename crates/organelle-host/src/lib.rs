@@ -25,7 +25,7 @@
 
 use organelle_manifest::{
     canonical_json, hash_value, sha256_hex, utc_now_iso, validate_input_against_schema,
-    validate_manifest_json, ManifestError, OrganelleManifest, Valence,
+    validate_manifest_json, ManifestError, OrganelleManifest, Transport, Valence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,10 +97,17 @@ impl CallContext {
 /// What an organelle may ask of the host. Deliberately narrow: the only
 /// outward call is to another organelle, and it is authority-checked
 /// (org-011). This is the membrane's outbound channel.
+///
+/// `caller_trace` is the trace id of the invocation that is currently
+/// executing the caller: the host re-resolves the caller's *routed*
+/// implementation version from it (P1: the same routing policy that
+/// executed the caller, so the boundary check consults the caller's real
+/// version, not blindly the latest).
 pub trait HostRef: Send + Sync {
     fn call_organelle(
         &self,
         caller_codon: &str,
+        caller_trace: &str,
         codon: &str,
         op: &str,
         input: Value,
@@ -152,6 +159,64 @@ pub struct Checkpoint {
 }
 
 // ---------------------------------------------------------------------------
+// Invocation binding (P1: identity + version + authority, bound once)
+// ---------------------------------------------------------------------------
+
+/// The (caller identity, organelle id, implementation version, granted
+/// capabilities, arrival transport) tuple bound to one invocation.
+///
+/// Established exactly once per invocation — at resolution time, before
+/// any authorization decision and before execution — and immutable
+/// afterwards: it is moved by value through the authorize -> execute ->
+/// receipt phases, never re-derived. The authorization decision and the
+/// execution below both consume THIS binding, so a version skew (authorize
+/// one implementation, execute another) is structurally impossible.
+/// Any failure to establish the binding is a fail-closed denial.
+#[derive(Debug, Clone)]
+pub struct InvocationBinding {
+    pub caller: String,
+    pub codon: String,
+    pub op: String,
+    /// Implementation version, resolved exactly once from the routing
+    /// policy. Both the capability check and `handle()` use this version's
+    /// manifest and implementation.
+    pub version: String,
+    /// The capabilities this invocation is authorized with: from the
+    /// verified grant (external surfaces), the caller's own context
+    /// (native surface), or the calling organelle's manifest (membrane).
+    pub granted_capabilities: Vec<String>,
+    /// Transport the invocation arrived over. `None` = internal membrane
+    /// action (organelle->organelle, lifecycle, control-plane), which is
+    /// not a surface arrival and skips transport restriction.
+    pub transport: Option<Transport>,
+}
+
+impl InvocationBinding {
+    /// Binding for control-plane / lifecycle receipts: not an organelle
+    /// invocation, so no capabilities and no arrival transport.
+    fn synthetic(caller: &str, codon: &str, op: &str, version: &str) -> Self {
+        InvocationBinding {
+            caller: caller.to_string(),
+            codon: codon.to_string(),
+            op: op.to_string(),
+            version: version.to_string(),
+            granted_capabilities: Vec::new(),
+            transport: None,
+        }
+    }
+}
+
+/// One codon resolution, captured once per invocation: the manifest, the
+/// implementation, and the binding. The lock is never held across
+/// `handle()`; the `Arc` keeps the exact resolved implementation alive
+/// for execution even if the registry changes underneath.
+struct ResolvedCall {
+    binding: InvocationBinding,
+    manifest: OrganelleManifest,
+    organelle: Arc<dyn Organelle>,
+}
+
+// ---------------------------------------------------------------------------
 // Receipts (org-010)
 // ---------------------------------------------------------------------------
 
@@ -194,6 +259,14 @@ pub struct Receipt {
     pub op: String,
     pub manifest_version: String,
     pub caller: String,
+    /// Granted capabilities bound to this invocation, established
+    /// pre-execution from the invocation binding (P1). Covered by the
+    /// receipt id hash; empty for control-plane receipts.
+    pub granted_capabilities: Vec<String>,
+    /// Transport the invocation arrived over (P1). `None` for internal
+    /// membrane actions (organelle->organelle calls, lifecycle,
+    /// control-plane). Covered by the receipt id hash.
+    pub transport: Option<Transport>,
     pub input_hash: String,
     /// sha256 of canonical output, or `denied:<reason>` / `rejected:<reason>`
     /// / `failed:<code>` for non-Ok verdicts (still content-addressed).
@@ -211,7 +284,10 @@ impl Receipt {
             "ts": self.ts, "seq": self.seq, "kind": self.kind,
             "codon": self.codon, "op": self.op,
             "manifest_version": self.manifest_version,
-            "caller": self.caller, "input_hash": self.input_hash,
+            "caller": self.caller,
+            "granted_capabilities": self.granted_capabilities,
+            "transport": self.transport,
+            "input_hash": self.input_hash,
             "output_hash": self.output_hash, "verdict": self.verdict,
             "valence": self.valence, "prev": self.prev,
             "note": self.note,
@@ -355,12 +431,12 @@ impl Host {
         id
     }
 
+    /// Build a receipt shell from the invocation binding established
+    /// pre-execution (P1): the receipt carries the bound tuple, it never
+    /// re-derives identity, version, or capabilities.
     fn receipt_shell(
         kind: ReceiptKind,
-        codon: &str,
-        op: &str,
-        version: &str,
-        caller: &str,
+        binding: &InvocationBinding,
         input: &Value,
         output_hash: String,
         verdict: CallVerdict,
@@ -372,10 +448,12 @@ impl Host {
             ts: utc_now_iso(),
             seq: 0,
             kind,
-            codon: codon.to_string(),
-            op: op.to_string(),
-            manifest_version: version.to_string(),
-            caller: caller.to_string(),
+            codon: binding.codon.clone(),
+            op: binding.op.clone(),
+            manifest_version: binding.version.clone(),
+            caller: binding.caller.clone(),
+            granted_capabilities: binding.granted_capabilities.clone(),
+            transport: binding.transport,
             input_hash: hash_value(input),
             output_hash,
             verdict,
@@ -465,12 +543,10 @@ impl Host {
             }
         }
 
+        let binding = InvocationBinding::synthetic("host", &codon, "register", &version);
         let r = Self::receipt_shell(
             ReceiptKind::Registration,
-            &codon,
-            "register",
-            &version,
-            "host",
+            &binding,
             &manifest_value,
             hash_value(&manifest_value),
             CallVerdict::Ok,
@@ -544,12 +620,10 @@ impl Host {
     /// Emit a fail-closed lifecycle refusal receipt and return the error
     /// string (carries the receipt id, like `CallError`).
     fn lifecycle_denied(&self, kind: ReceiptKind, codon: &str, op: &str, reason: String) -> String {
+        let binding = InvocationBinding::synthetic("host", codon, op, "-");
         let rid = self.emit_receipt(Self::receipt_shell(
             kind,
-            codon,
-            op,
-            "-",
-            "host",
+            &binding,
             &serde_json::json!({"codon": codon}),
             format!("denied:{reason}"),
             CallVerdict::Denied,
@@ -577,10 +651,7 @@ impl Host {
         let checkpoint_hash = sha256_hex(&checkpoint.bytes);
         self.emit_receipt(Self::receipt_shell(
             ReceiptKind::Suspend,
-            codon,
-            "suspend",
-            &version,
-            "host",
+            &InvocationBinding::synthetic("host", codon, "suspend", &version),
             &serde_json::json!({"codon": codon}),
             checkpoint_hash.clone(),
             CallVerdict::Ok,
@@ -592,10 +663,7 @@ impl Host {
         ));
         self.emit_receipt(Self::receipt_shell(
             ReceiptKind::Checkpoint,
-            codon,
-            "checkpoint",
-            &version,
-            "host",
+            &InvocationBinding::synthetic("host", codon, "checkpoint", &version),
             &serde_json::json!({"codon": codon}),
             checkpoint_hash,
             CallVerdict::Ok,
@@ -625,10 +693,7 @@ impl Host {
         organelle.kill();
         self.emit_receipt(Self::receipt_shell(
             ReceiptKind::Kill,
-            codon,
-            "kill",
-            &version,
-            "host",
+            &InvocationBinding::synthetic("host", codon, "kill", &version),
             &serde_json::json!({"codon": codon}),
             sha256_hex(&checkpoint.bytes),
             CallVerdict::Ok,
@@ -643,6 +708,9 @@ impl Host {
     /// Invoke an organelle. Every path — ok, denied, rejected, failed —
     /// emits exactly one receipt. There is no silent pass.
     /// (org-003: this `&self` method IS the native in-process surface.)
+    ///
+    /// P1: the arrival transport is `Native` — the surface is bound by the
+    /// entry point, never by caller-supplied data.
     pub fn call(
         &self,
         ctx: &CallContext,
@@ -650,7 +718,157 @@ impl Host {
         op: &str,
         input: Value,
     ) -> Result<Value, CallError> {
-        self.call_with_gate2(ctx, codon, op, input)
+        self.call_with_gate2(ctx, codon, op, input, Some(Transport::Native))
+    }
+
+    /// Internal dispatch: resolve the codon exactly once, establish the
+    /// [`InvocationBinding`] (P1), authorize against that same resolution,
+    /// and execute the resolved implementation. `arrival` is the transport
+    /// the invocation arrived over (`None` = internal membrane call).
+    pub(crate) fn call_with_gate2(
+        &self,
+        ctx: &CallContext,
+        codon: &str,
+        op: &str,
+        input: Value,
+        arrival: Option<Transport>,
+    ) -> Result<Value, CallError> {
+        // Phase 0+1, under one read lock: profile gate, single resolution,
+        // binding established, authorization against the SAME resolution.
+        // The lock is dropped before any handler runs.
+        let resolved: Result<ResolvedCall, (CallVerdict, String)> = {
+            let inner = self.inner.read().unwrap();
+            let gate: Gate2 = if let Some(active) = &inner.active_profile {
+                let ok = inner
+                    .profiles
+                    .get(active)
+                    .is_some_and(|cs| cs.contains(&codon.to_string()));
+                if !ok {
+                    Gate2::Stop {
+                        reason: format!("codon \"{codon}\" not in active profile \"{active}\""),
+                    }
+                } else {
+                    match self.resolve_locked(&inner, codon, &ctx.trace_id) {
+                        Ok((_, e)) => self.authorize(&e.manifest, &e.organelle, ctx, op, &input, arrival),
+                        Err(reason) => Gate2::Stop { reason },
+                    }
+                }
+            } else {
+                match self.resolve_locked(&inner, codon, &ctx.trace_id) {
+                    Ok((_, e)) => self.authorize(&e.manifest, &e.organelle, ctx, op, &input, arrival),
+                    Err(reason) => Gate2::Stop { reason },
+                }
+            };
+            match gate {
+                Gate2::Go { manifest, organelle, version } => Ok(ResolvedCall {
+                    binding: InvocationBinding {
+                        caller: ctx.caller.clone(),
+                        codon: codon.to_string(),
+                        op: op.to_string(),
+                        version,
+                        granted_capabilities: ctx.capabilities.clone(),
+                        transport: arrival,
+                    },
+                    manifest,
+                    organelle,
+                }),
+                Gate2::Stop { reason } => Err((CallVerdict::Denied, reason)),
+                Gate2::StopRejected { reason } => Err((CallVerdict::Rejected, reason)),
+            }
+        };
+
+        // The receipt is built from the pre-execution binding. For refusals
+        // the binding was never established: synthesize a denial binding
+        // carrying the arrival transport so the record still names where
+        // the attempt came from.
+        let binding = match &resolved {
+            Ok(rc) => rc.binding.clone(),
+            Err(_) => InvocationBinding {
+                caller: ctx.caller.clone(),
+                codon: codon.to_string(),
+                op: op.to_string(),
+                version: "-".to_string(),
+                granted_capabilities: ctx.capabilities.clone(),
+                transport: arrival,
+            },
+        };
+
+        match resolved {
+            Err((v, reason)) => {
+                let tag = match v {
+                    CallVerdict::Denied => "denied",
+                    CallVerdict::Rejected => "rejected",
+                    _ => "stopped",
+                };
+                let receipt_id = self.emit_receipt(Self::receipt_shell(
+                    ReceiptKind::Invocation,
+                    &binding,
+                    &input,
+                    format!("{tag}:{reason}"),
+                    v,
+                    Valence::Candidate,
+                    Some(reason.clone()),
+                ));
+                Err(CallError { verdict: v, reason, receipt_id })
+            }
+            Ok(rc) => self.invoke_resolved(ctx, rc, input),
+        }
+    }
+
+    /// Execute an already-resolved, already-authorized invocation (phase 2).
+    /// Consumes the exact [`ResolvedCall`] the binding and the
+    /// authorization decision were built from — nothing re-resolves here,
+    /// so authorization and execution can never consult different
+    /// implementation versions. The lock is never held across `handle()`.
+    fn invoke_resolved(
+        &self,
+        ctx: &CallContext,
+        rc: ResolvedCall,
+        input: Value,
+    ) -> Result<Value, CallError> {
+        let binding = rc.binding.clone();
+        let (verdict, output_hash, valence, note, result): (
+            CallVerdict,
+            String,
+            Valence,
+            Option<String>,
+            Result<Value, CallError>,
+        ) = match rc.organelle.handle(ctx, self, &binding.op, input.clone()) {
+            Ok(output) => (
+                CallVerdict::Ok,
+                hash_value(&output),
+                rc.manifest.authority.declared_valence,
+                None,
+                Ok(output),
+            ),
+            Err(e) => (
+                CallVerdict::Failed,
+                format!("failed:{}", e.code),
+                Valence::Disproven,
+                Some(e.to_string()),
+                Err(CallError {
+                    verdict: CallVerdict::Failed,
+                    reason: e.to_string(),
+                    receipt_id: String::new(),
+                }),
+            ),
+        };
+        let receipt_id = self.emit_receipt(Self::receipt_shell(
+            ReceiptKind::Invocation,
+            &binding,
+            &input,
+            output_hash,
+            verdict,
+            valence,
+            note,
+        ));
+        match result {
+            Ok(output) => Ok(output),
+            Err(mut e) => {
+                e.receipt_id = receipt_id;
+                Err(e)
+            }
+        }
     }
 
     // -- capability grants (P0: unforgeable authority) -----------------------
@@ -700,10 +918,17 @@ impl Host {
     /// rejection / failure distinction of `call` is preserved; grant
     /// failures are Denied (never Rejected — the request was well-formed,
     /// the authority was not).
+    ///
+    /// P1: `transport` names the surface this invocation arrived over
+    /// (bound by the surface, never by caller-supplied data). It becomes
+    /// part of the invocation binding and the organelle's declared
+    /// transports are enforced against it: arrival over a non-declared
+    /// transport is a fail-closed denial.
     pub fn call_with_grant(
         &self,
         grant: &str,
         caller_claim: Option<&str>,
+        transport: Transport,
         codon: &str,
         op: &str,
         input: Value,
@@ -711,7 +936,16 @@ impl Host {
         let caller_label = caller_claim.unwrap_or("unauthenticated");
         let verified = match self.verify_grant(grant) {
             Ok(v) => v,
-            Err(e) => return Err(self.grant_denied(caller_label, codon, op, &input, e.to_string())),
+            Err(e) => {
+                return Err(self.grant_denied(
+                    caller_label,
+                    codon,
+                    op,
+                    &input,
+                    Some(transport),
+                    e.to_string(),
+                ))
+            }
         };
         if let Some(claim) = caller_claim {
             if claim != verified.caller {
@@ -720,6 +954,7 @@ impl Host {
                     codon,
                     op,
                     &input,
+                    Some(transport),
                     format!(
                         "caller claim \"{claim}\" does not match grant subject"
                     ),
@@ -729,26 +964,33 @@ impl Host {
         // Capabilities come ONLY from the trusted grant. Whatever the
         // caller claimed on the wire is not even read.
         let ctx = CallContext::new(verified.caller, verified.capabilities);
-        self.call(&ctx, codon, op, input)
+        self.call_with_gate2(&ctx, codon, op, input, Some(transport))
     }
 
     /// Emit a fail-closed denial receipt for a grant failure and return the
     /// `CallError` carrying its id (mirrors the Phase1::Stop arm: refusal
-    /// without a receipt is a bug).
+    /// without a receipt is a bug). The arrival transport is recorded even
+    /// though no binding was established.
     fn grant_denied(
         &self,
         caller: &str,
         codon: &str,
         op: &str,
         input: &Value,
+        transport: Option<Transport>,
         reason: String,
     ) -> CallError {
+        let binding = InvocationBinding {
+            caller: caller.to_string(),
+            codon: codon.to_string(),
+            op: op.to_string(),
+            version: "-".to_string(),
+            granted_capabilities: Vec::new(),
+            transport,
+        };
         let receipt_id = self.emit_receipt(Self::receipt_shell(
             ReceiptKind::Invocation,
-            codon,
-            op,
-            "-",
-            caller,
+            &binding,
             input,
             format!("denied:{reason}"),
             CallVerdict::Denied,
@@ -762,15 +1004,20 @@ impl Host {
         }
     }
 
-    /// Authorize op + capability + input schema. Pure w.r.t. &self.
+    /// Authorize op + transport + capability + input schema against the
+    /// single resolved manifest. Pure w.r.t. &self. The manifest is the
+    /// SAME resolution the execution will consume (P1): authorization
+    /// never consults a different implementation version than execution.
     fn authorize(
         &self,
-        entry: &VersionedEntry,
+        manifest: &OrganelleManifest,
+        organelle: &Arc<dyn Organelle>,
         ctx: &CallContext,
         op: &str,
         input: &Value,
+        arrival: Option<Transport>,
     ) -> Gate2 {
-        let m = &entry.manifest;
+        let m = manifest;
         let contract = match m.contract(op) {
             Some(c) => c,
             None => {
@@ -779,6 +1026,29 @@ impl Host {
                 }
             }
         };
+        // P1: declared transport restrictions are enforced at the host.
+        // Arrival over a non-declared transport is a Denied verdict, never
+        // a default-allow. `arrival == None` is an internal membrane call
+        // (organelle->organelle), not a surface arrival: transport
+        // restriction does not apply there; granted capabilities do.
+        // Note: a manifest with no declared transports can never be
+        // registered (fail-closed at manifest validation), so there is no
+        // "unrestricted" case — every registered organelle declares >= 1.
+        if let Some(t) = arrival {
+            if !m.transports.contains(&t) {
+                let declared: Vec<&str> =
+                    m.transports.iter().map(|x| x.as_str()).collect();
+                return Gate2::Stop {
+                    reason: format!(
+                        "transport \"{}\" not declared for {}@{} (declared: {})",
+                        t.as_str(),
+                        m.codon,
+                        m.version,
+                        declared.join(","),
+                    ),
+                };
+            }
+        }
         let (mc, cap) = m.authority_for(op);
         let _ = mc;
         if let Some(need) = cap {
@@ -798,7 +1068,7 @@ impl Host {
         }
         Gate2::Go {
             manifest: m.clone(),
-            organelle: entry.organelle.clone(),
+            organelle: organelle.clone(),
             version: m.version.clone(),
         }
     }
@@ -808,50 +1078,91 @@ impl Host {
     /// Called by organelles via `HostRef`. The calling organelle's
     /// *granted* capabilities are checked against the callee's required
     /// capability; excess is denied and logged (fail-closed).
+    ///
+    /// P1: both ends are resolved exactly once, under one lock, through
+    /// the same routing policy the surface calls use. The boundary check
+    /// and the execution consume the SAME callee resolution — the old
+    /// code authorized against `vs.last()` (always the latest registered
+    /// version) but executed the routed version, so a pinned/old version
+    /// could be authorized under a newer version's policy. The caller's
+    /// routed version is re-derived from the outer invocation's
+    /// `caller_trace` so split-routed callers keep the version that is
+    /// actually executing.
     pub fn call_as_organelle(
         &self,
         caller_codon: &str,
+        caller_trace: &str,
         codon: &str,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
-        let (granted, callee_need): (Vec<String>, Option<String>) = {
+        let (caller_manifest, callee): (OrganelleManifest, ResolvedCall) = {
             let inner = self.inner.read().unwrap();
-            let caller_manifest = inner
-                .organelles
-                .get(caller_codon)
-                .and_then(|vs| vs.last())
-                .map(|e| e.manifest.clone());
-            let callee_manifest = inner
-                .organelles
-                .get(codon)
-                .and_then(|vs| vs.last())
-                .map(|e| e.manifest.clone());
-            match (caller_manifest, callee_manifest) {
-                (Some(cm), Some(tm)) => {
-                    let (_, need) = tm.authority_for(op);
-                    (cm.authority.granted_capabilities.clone(), need.map(|s| s.to_string()))
-                }
-                _ => {
+            let caller_manifest = match self.resolve_locked(&inner, caller_codon, caller_trace) {
+                Ok((_, e)) => e.manifest.clone(),
+                Err(reason) => {
                     return Err(OrganelleError::denied(format!(
-                        "boundary: unknown codon in organelle->organelle call ({caller_codon} -> {codon})"
+                        "boundary: unknown caller codon \"{caller_codon}\": {reason}"
                     )))
                 }
-            }
+            };
+            let (_, callee_entry) = match self.resolve_locked(&inner, codon, caller_trace) {
+                Ok(v) => v,
+                Err(reason) => {
+                    return Err(OrganelleError::denied(format!(
+                        "boundary: unknown callee codon \"{codon}\": {reason}"
+                    )))
+                }
+            };
+            // The binding is established HERE, once, before the boundary
+            // check: caller identity, callee id, resolved implementation
+            // version, and the caller's granted capabilities.
+            let callee = ResolvedCall {
+                binding: InvocationBinding {
+                    caller: format!("organelle:{caller_codon}"),
+                    codon: codon.to_string(),
+                    op: op.to_string(),
+                    version: callee_entry.manifest.version.clone(),
+                    granted_capabilities: caller_manifest
+                        .authority
+                        .granted_capabilities
+                        .clone(),
+                    // Membrane-internal: not a surface arrival, so no
+                    // transport restriction applies (granted caps govern).
+                    transport: None,
+                },
+                manifest: callee_entry.manifest.clone(),
+                organelle: callee_entry.organelle.clone(),
+            };
+            (caller_manifest, callee)
         };
-        if let Some(need) = callee_need {
-            if !granted.iter().any(|c| c == &need) {
+        // Lock dropped before any handler runs: no registry lock is held
+        // across the boundary check's receipt or the callee's handle().
+
+        // Boundary authorization against the SAME resolved callee manifest
+        // the execution will use — not the latest, not a second lookup.
+        let (_, need) = callee.manifest.authority_for(op);
+        if let Some(need) = need {
+            if !callee
+                .binding
+                .granted_capabilities
+                .iter()
+                .any(|c| c == need)
+            {
                 let reason = format!(
-                    "organelle \"{caller_codon}\" lacks granted capability \"{need}\" for {codon}.{op}"
+                    "organelle \"{caller_codon}\" ({}@{}) lacks granted capability \"{need}\" for {}@{}",
+                    caller_manifest.name,
+                    caller_manifest.version,
+                    callee.binding.codon,
+                    callee.binding.version,
                 );
-                // Log the denial AND receipt it (no silent pass).
-                let ctx = CallContext::new(format!("organelle:{caller_codon}"), granted);
+                // Log the denial AND receipt it (no silent pass). The
+                // receipt carries the established binding: caller identity,
+                // callee id, resolved version, granted caps.
+                let binding = &callee.binding;
                 let rid = self.emit_receipt(Self::receipt_shell(
                     ReceiptKind::Invocation,
-                    codon,
-                    op,
-                    "-",
-                    &ctx.caller,
+                    binding,
                     &input,
                     format!("denied:{reason}"),
                     CallVerdict::Denied,
@@ -869,9 +1180,65 @@ impl Host {
                 return Err(OrganelleError::denied(reason));
             }
         }
-        let ctx = CallContext::new(format!("organelle:{caller_codon}"), granted);
-        self.call(&ctx, codon, op, input)
-            .map_err(|e| OrganelleError::new("denied", e.reason))
+        // Execute the EXACT resolved entry: no re-resolution, so the
+        // version the boundary authorized is the version that runs.
+        // Phase-1 gates (profile, op exists, input schema) run against
+        // the same resolved manifest; arrival=None because this is a
+        // membrane-internal call, not a surface arrival.
+        let ctx = CallContext::new(
+            format!("organelle:{caller_codon}"),
+            callee.binding.granted_capabilities.clone(),
+        );
+        let gate: Gate2 = {
+            let inner = self.inner.read().unwrap();
+            if let Some(active) = &inner.active_profile {
+                let ok = inner
+                    .profiles
+                    .get(active)
+                    .is_some_and(|cs| cs.contains(&codon.to_string()));
+                if !ok {
+                    Gate2::Stop {
+                        reason: format!("codon \"{codon}\" not in active profile \"{active}\""),
+                    }
+                } else {
+                    self.authorize(&callee.manifest, &callee.organelle, &ctx, op, &input, None)
+                }
+            } else {
+                self.authorize(&callee.manifest, &callee.organelle, &ctx, op, &input, None)
+            }
+        };
+        match gate {
+            Gate2::Go { .. } => self
+                .invoke_resolved(&ctx, callee, input)
+                .map_err(|e| OrganelleError::new("denied", e.reason)),
+            Gate2::Stop { reason } => {
+                let rid = self.emit_receipt(Self::receipt_shell(
+                    ReceiptKind::Invocation,
+                    &callee.binding,
+                    &input,
+                    format!("denied:{reason}"),
+                    CallVerdict::Denied,
+                    Valence::Candidate,
+                    Some(reason.clone()),
+                ));
+                Err(OrganelleError::denied(format!("{reason} (receipt {rid})")))
+            }
+            Gate2::StopRejected { reason } => {
+                let rid = self.emit_receipt(Self::receipt_shell(
+                    ReceiptKind::Invocation,
+                    &callee.binding,
+                    &input,
+                    format!("rejected:{reason}"),
+                    CallVerdict::Rejected,
+                    Valence::Candidate,
+                    Some(reason.clone()),
+                ));
+                Err(OrganelleError::new(
+                    "rejected",
+                    format!("{reason} (receipt {rid})"),
+                ))
+            }
+        }
     }
 
     // -- profiles (org-009) -------------------------------------------------
@@ -912,12 +1279,10 @@ impl Host {
             inner.active_profile = Some(name.to_string());
             prev
         };
+        let binding = InvocationBinding::synthetic("host", "-", "profile.activate", "-");
         let rid = self.emit_receipt(Self::receipt_shell(
             ReceiptKind::ProfileActivate,
-            "-",
-            "profile.activate",
-            "-",
-            "host",
+            &binding,
             &serde_json::json!({"profile": name, "codons": codons}),
             hash_value(&serde_json::json!(codons)),
             CallVerdict::Ok,
@@ -940,12 +1305,10 @@ impl Host {
             let mut inner = self.inner.write().unwrap();
             inner.active_profile = prev.clone();
         }
+        let binding = InvocationBinding::synthetic("host", "-", "profile.rollback", "-");
         let rid = self.emit_receipt(Self::receipt_shell(
             ReceiptKind::ProfileRollback,
-            "-",
-            "profile.rollback",
-            "-",
-            "host",
+            &binding,
             &serde_json::json!({"restored": prev}),
             "rolled-back".to_string(),
             CallVerdict::Ok,
@@ -993,12 +1356,10 @@ impl Host {
             inner.routes.insert(codon.to_string(), policy.clone());
             prev
         };
+        let binding = InvocationBinding::synthetic("host", codon, "route.set", "-");
         let rid = self.emit_receipt(Self::receipt_shell(
             ReceiptKind::RouteChange,
-            codon,
-            "route.set",
-            "-",
-            "host",
+            &binding,
             &serde_json::json!({"policy": format!("{policy:?}")}),
             hash_value(&serde_json::json!(format!("{policy:?}"))),
             CallVerdict::Ok,
@@ -1022,12 +1383,10 @@ impl Host {
             let mut inner = self.inner.write().unwrap();
             inner.routes.insert(codon.to_string(), prev.clone());
         }
+        let binding = InvocationBinding::synthetic("host", codon, "route.rollback", "-");
         let rid = self.emit_receipt(Self::receipt_shell(
             ReceiptKind::RouteRollback,
-            codon,
-            "route.rollback",
-            "-",
-            "host",
+            &binding,
             &serde_json::json!({"restored": format!("{prev:?}")}),
             "rolled-back".to_string(),
             CallVerdict::Ok,
@@ -1053,149 +1412,16 @@ enum Gate2 {
     },
 }
 
-impl Host {
-    // Re-map Gate2 into the phase-1 Gate used by call(). Kept separate so
-    // the denied-vs-rejected distinction survives to the receipt.
-    fn gate2_to_phase1(&self, g: Gate2) -> Phase1 {
-        match g {
-            Gate2::Go { manifest, organelle, version } => Phase1::Go { manifest, organelle, version },
-            Gate2::Stop { reason } => Phase1::Stop { reason, verdict: CallVerdict::Denied },
-            Gate2::StopRejected { reason } => Phase1::Stop { reason, verdict: CallVerdict::Rejected },
-        }
-    }
-}
-
-enum Phase1 {
-    Go {
-        manifest: OrganelleManifest,
-        organelle: Arc<dyn Organelle>,
-        version: String,
-    },
-    Stop {
-        reason: String,
-        verdict: CallVerdict,
-    },
-}
-
 impl HostRef for Host {
     fn call_organelle(
         &self,
         caller_codon: &str,
+        caller_trace: &str,
         codon: &str,
         op: &str,
         input: Value,
     ) -> Result<Value, OrganelleError> {
-        self.call_as_organelle(caller_codon, codon, op, input)
-    }
-}
-
-// NOTE: `call` above uses an inline `Gate` enum; the authorize() helper
-// returns Gate2. To keep the two in agreement without duplicating logic,
-// call() delegates the whole phase-1 through a small adapter. The adapter
-// is exercised by tests; the match arms are exhaustive so a new Gate2
-// variant is a compile error here, not a silent pass.
-impl Host {
-    pub(crate) fn call_with_gate2(
-        &self,
-        ctx: &CallContext,
-        codon: &str,
-        op: &str,
-        input: Value,
-    ) -> Result<Value, CallError> {
-        let phase1: Phase1 = {
-            let inner = self.inner.read().unwrap();
-            let g: Gate2 = if let Some(active) = &inner.active_profile {
-                let ok = inner
-                    .profiles
-                    .get(active)
-                    .is_some_and(|cs| cs.contains(&codon.to_string()));
-                if !ok {
-                    Gate2::Stop {
-                        reason: format!("codon \"{codon}\" not in active profile \"{active}\""),
-                    }
-                } else {
-                    match self.resolve_locked(&inner, codon, &ctx.trace_id) {
-                        Ok((_, e)) => self.authorize(e, ctx, op, &input),
-                        Err(reason) => Gate2::Stop { reason },
-                    }
-                }
-            } else {
-                match self.resolve_locked(&inner, codon, &ctx.trace_id) {
-                    Ok((_, e)) => self.authorize(e, ctx, op, &input),
-                    Err(reason) => Gate2::Stop { reason },
-                }
-            };
-            self.gate2_to_phase1(g)
-        };
-
-        let (verdict, output_hash, valence, note, result): (
-            CallVerdict,
-            String,
-            Valence,
-            Option<String>,
-            Result<(Value, String), CallError>,
-        ) = match phase1 {
-            Phase1::Stop { reason, verdict } => {
-                let tag = match verdict {
-                    CallVerdict::Denied => "denied",
-                    CallVerdict::Rejected => "rejected",
-                    _ => "stopped",
-                };
-                (
-                    verdict,
-                    format!("{tag}:{reason}"),
-                    Valence::Candidate,
-                    Some(reason.clone()),
-                    Err(CallError { verdict, reason, receipt_id: String::new() }),
-                )
-            }
-            Phase1::Go { manifest, organelle, version } => {
-                match organelle.handle(ctx, self, op, input.clone()) {
-                    Ok(output) => (
-                        CallVerdict::Ok,
-                        hash_value(&output),
-                        manifest.authority.declared_valence,
-                        None,
-                        Ok((output, version)),
-                    ),
-                    Err(e) => (
-                        CallVerdict::Failed,
-                        format!("failed:{}", e.code),
-                        Valence::Disproven,
-                        Some(e.to_string()),
-                        Err(CallError {
-                            verdict: CallVerdict::Failed,
-                            reason: e.to_string(),
-                            receipt_id: String::new(),
-                        }),
-                    ),
-                }
-            }
-        };
-
-        let version = match &result {
-            Ok((_, v)) => v.clone(),
-            Err(_) => "-".to_string(),
-        };
-        let receipt_id = self.emit_receipt(Self::receipt_shell(
-            ReceiptKind::Invocation,
-            codon,
-            op,
-            &version,
-            &ctx.caller,
-            &input,
-            output_hash,
-            verdict,
-            valence,
-            note,
-        ));
-        match result {
-            Ok((output, _)) => Ok(output),
-            Err(mut e) => {
-                e.receipt_id = receipt_id;
-                Err(e)
-            }
-        }
+        self.call_as_organelle(caller_codon, caller_trace, codon, op, input)
     }
 }
 
@@ -1283,8 +1509,12 @@ mod tests {
     }
 
     /// Organelle that calls another organelle through the host (org-011).
+    /// P1: threads the outer invocation's trace id so the host resolves
+    /// the caller's routed version (not blindly the latest).
     struct Caller {
         manifest: OrganelleManifest,
+        target_codon: String,
+        target_op: String,
     }
 
     impl Organelle for Caller {
@@ -1293,13 +1523,29 @@ mod tests {
         }
         fn handle(
             &self,
-            _ctx: &CallContext,
+            ctx: &CallContext,
             host: &dyn HostRef,
             op: &str,
             input: Value,
         ) -> Result<Value, OrganelleError> {
             assert_eq!(op, "relay");
-            host.call_organelle(&self.manifest.codon, "te", "sealed", input)
+            // P1: thread the outer invocation's trace id so the host
+            // re-resolves the caller's routed version, not blindly latest.
+            host.call_organelle(
+                &self.manifest.codon,
+                &ctx.trace_id,
+                &self.target_codon,
+                &self.target_op,
+                input,
+            )
+        }
+    }
+
+    fn caller(codon: &str, granted: Vec<String>, target_codon: &str, target_op: &str) -> Caller {
+        Caller {
+            manifest: caller_manifest(codon, granted),
+            target_codon: target_codon.to_string(),
+            target_op: target_op.to_string(),
         }
     }
 
@@ -1428,13 +1674,13 @@ mod tests {
         // Grant confers te.write -> gated op passes.
         let g = grant_ctx_caps(&h, "ext", &["te.write"]);
         let out = h
-            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .unwrap();
         assert_eq!(out["sealed"], serde_json::json!(true));
         // Grant without the capability -> denied by the host's authorize().
         let g2 = grant_ctx_caps(&h, "ext", &[]);
         let e = h
-            .call_with_grant(&g2, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .call_with_grant(&g2, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("te.write"));
@@ -1450,7 +1696,7 @@ mod tests {
         chars[0] = if chars[0] == '0' { '1' } else { '0' };
         let forged = format!("{}.{}", chars.into_iter().collect::<String>(), tag);
         let e = h
-            .call_with_grant(&forged, Some("ext"), "te", "echo", serde_json::json!({}))
+            .call_with_grant(&forged, Some("ext"), Transport::Native, "te", "echo", serde_json::json!({}))
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("signature"));
@@ -1465,7 +1711,7 @@ mod tests {
         let h = echo_host();
         let g = grant_ctx_caps(&h, "alice", &["te.write"]);
         let e = h
-            .call_with_grant(&g, Some("mallory"), "te", "sealed", serde_json::json!({}))
+            .call_with_grant(&g, Some("mallory"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("does not match grant subject"));
@@ -1476,7 +1722,7 @@ mod tests {
         let h = echo_host();
         for grant in ["", "garbage", "a.b"] {
             let e = h
-                .call_with_grant(grant, Some("ext"), "te", "echo", serde_json::json!({}))
+                .call_with_grant(grant, Some("ext"), Transport::Native, "te", "echo", serde_json::json!({}))
                 .unwrap_err();
             assert_eq!(e.verdict, CallVerdict::Denied, "grant {grant:?}");
         }
@@ -1487,10 +1733,10 @@ mod tests {
         let h = echo_host();
         let g = h.issue_single_use_grant("ext", vec!["te.write".to_string()], 300);
         assert!(h
-            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .is_ok());
         let e = h
-            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("replay"));
@@ -1501,7 +1747,7 @@ mod tests {
         let h = echo_host();
         let g = h.issue_grant("ext", vec!["te.write".to_string()], 0);
         let e = h
-            .call_with_grant(&g, Some("ext"), "te", "sealed", serde_json::json!({}))
+            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("expired"));
@@ -1663,7 +1909,7 @@ mod tests {
     #[test]
     fn organelle_to_organelle_granted_ok() {
         let h = echo_host();
-        h.register(Arc::new(Caller { manifest: caller_manifest("ca", vec!["te.write".to_string()]) }))
+        h.register(Arc::new(caller("ca", vec!["te.write".to_string()], "te", "sealed")))
             .unwrap();
         let out = h
             .call(&ctx_with(&[]), "ca", "relay", serde_json::json!({}))
@@ -1675,7 +1921,7 @@ mod tests {
     #[test]
     fn organelle_to_organelle_denied_and_logged() {
         let h = echo_host();
-        h.register(Arc::new(Caller { manifest: caller_manifest("cb", vec![]) })).unwrap();
+        h.register(Arc::new(caller("cb", vec![], "te", "sealed"))).unwrap();
         let e = h.call(&ctx(), "cb", "relay", serde_json::json!({})).unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Failed); // relay itself failed: boundary denial inside
         assert!(e.reason.contains("lacks granted capability"));
@@ -1861,6 +2107,251 @@ mod tests {
         let new = &h.receipts()[before..];
         assert_eq!(new.len(), 2 + 3); // suspend(2) + kill(3)
         assert_eq!(new[4].kind, ReceiptKind::Kill);
+        assert!(h.verify_chain().is_ok());
+    }
+
+    // -- P1: bind identity, version, authority to each invocation --------
+
+    /// Manifest helper for the version-skew tests: the "sealed" op
+    /// requires `sealed_cap` (`None` = read-only, no cap required).
+    fn skew_manifest(codon: &str, version: &str, sealed_cap: Option<&str>) -> OrganelleManifest {
+        let mut m = test_manifest(codon, version, vec![]);
+        for c in &mut m.contracts {
+            if c.op == "sealed" {
+                c.required_capability = sealed_cap.map(|s| s.to_string());
+                if sealed_cap.is_none() {
+                    // Write with no capability is fail-closed at
+                    // registration; drop to the inherited ReadOnly.
+                    c.mutation_class = None;
+                }
+            }
+        }
+        m
+    }
+
+    fn skew_host() -> Arc<Host> {
+        let h = Host::new();
+        // v1 (will be pinned/routed): sealed requires "te.v1cap".
+        h.register(Arc::new(Echo {
+            manifest: skew_manifest("sk", "1.0.0", Some("te.v1cap")),
+            tag: "v1".into(),
+        }))
+        .unwrap();
+        // v2 (latest): sealed requires nothing.
+        h.register(Arc::new(Echo {
+            manifest: skew_manifest("sk", "2.0.0", None),
+            tag: "v2".into(),
+        }))
+        .unwrap();
+        h.set_route("sk", RoutePolicy::Pinned("1.0.0".to_string()))
+            .unwrap();
+        h
+    }
+
+    #[test]
+    fn version_skew_boundary_and_execution_use_same_version() {
+        // The attack: authorize one implementation, execute another. The
+        // old code authorized organelle->organelle calls against
+        // `vs.last()` (always the latest, here v2 with no capability
+        // requirement) but executed the routed version (v1, which requires
+        // "te.v1cap") — the boundary passed while execution ran under a
+        // stricter policy. Post-fix both consult the single resolved v1.
+        let h = skew_host();
+        h.register(Arc::new(caller("ca", vec![], "sk", "sealed")))
+            .unwrap();
+        let e = h.call(&ctx(), "ca", "relay", serde_json::json!({})).unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Failed); // relay failed: boundary denial inside
+        assert!(e.reason.contains("lacks granted capability"), "got: {}", e.reason);
+        // The boundary denied against the ROUTED version's policy and
+        // logged it (pre-fix: no boundary denial — it passed on v2).
+        let denials = h.boundary_denials();
+        assert_eq!(denials.len(), 1);
+        assert!(denials[0].reason.contains("te.v1cap"), "got: {}", denials[0].reason);
+        assert!(denials[0].reason.contains("1.0.0"), "got: {}", denials[0].reason);
+        // The denial receipt carries the established binding: the resolved
+        // version is 1.0.0 (not "-"), caller identity is bound, and the
+        // membrane-internal call records no surface transport.
+        let r = h
+            .receipts()
+            .iter()
+            .find(|r| r.id == denials[0].receipt_id)
+            .unwrap()
+            .clone();
+        assert_eq!(r.manifest_version, "1.0.0");
+        assert_eq!(r.caller, "organelle:ca");
+        assert_eq!(r.codon, "sk");
+        assert!(r.granted_capabilities.is_empty());
+        assert_eq!(r.transport, None);
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn version_skew_authorize_and_execute_agree_on_routed_version() {
+        // Positive control: with the v1 capability granted, the boundary
+        // authorizes on v1's policy AND v1 executes — one version, one
+        // binding, end to end.
+        let h = skew_host();
+        h.register(Arc::new(caller("cb", vec!["te.v1cap".to_string()], "sk", "sealed")))
+            .unwrap();
+        let out = h.call(&ctx(), "cb", "relay", serde_json::json!({})).unwrap();
+        assert_eq!(out["sealed"], serde_json::json!(true));
+        assert!(h.boundary_denials().is_empty());
+        let r = h
+            .receipts()
+            .iter()
+            .find(|r| r.kind == ReceiptKind::Invocation && r.codon == "sk")
+            .unwrap()
+            .clone();
+        assert_eq!(r.verdict, CallVerdict::Ok);
+        assert_eq!(r.manifest_version, "1.0.0");
+        assert_eq!(r.caller, "organelle:cb");
+        assert_eq!(r.granted_capabilities, vec!["te.v1cap".to_string()]);
+        assert_eq!(r.transport, None); // membrane-internal, not a surface arrival
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn version_bound_once_authorize_and_execute_agree() {
+        // Surface path: pinned route — the authorized version IS the
+        // executed version, and the receipt says so.
+        let h = echo_host();
+        h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
+            .unwrap();
+        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string())).unwrap();
+        let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
+        assert_eq!(out["tag"], serde_json::json!("v1")); // executed v1
+        let r = h.receipts().last().unwrap().clone();
+        assert_eq!(r.manifest_version, "1.0.0"); // authorized v1
+        assert_eq!(r.transport, Some(Transport::Native));
+        assert_eq!(r.caller, "test");
+        assert!(r.granted_capabilities.is_empty());
+    }
+
+    fn rest_only_manifest(codon: &str, version: &str) -> OrganelleManifest {
+        let mut m = test_manifest(codon, version, vec![]);
+        m.transports = vec![Transport::Rest];
+        m
+    }
+
+    #[test]
+    fn transport_restriction_native_denied_when_not_declared() {
+        let h = Host::new();
+        h.register(Arc::new(Echo {
+            manifest: rest_only_manifest("ro", "1.0.0"),
+            tag: "r".into(),
+        }))
+        .unwrap();
+        let e = h.call(&ctx(), "ro", "echo", serde_json::json!({})).unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Denied);
+        assert!(e.reason.contains("not declared"), "got: {}", e.reason);
+        assert!(e.reason.contains("native"), "got: {}", e.reason);
+        // The refusal is receipted with the arrival transport recorded.
+        let r = h.receipts().last().unwrap().clone();
+        assert_eq!(r.verdict, CallVerdict::Denied);
+        assert_eq!(r.transport, Some(Transport::Native));
+        assert_eq!(r.manifest_version, "-"); // refused before a binding was established
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn transport_restriction_declared_surface_ok() {
+        let h = Host::new();
+        h.register(Arc::new(Echo {
+            manifest: rest_only_manifest("ro", "1.0.0"),
+            tag: "r".into(),
+        }))
+        .unwrap();
+        let g = h.issue_grant("ext", vec![], 300);
+        let out = h
+            .call_with_grant(&g, Some("ext"), Transport::Rest, "ro", "echo", serde_json::json!({"a": 1}))
+            .unwrap();
+        assert_eq!(out["tag"], serde_json::json!("r"));
+        let r = h.receipts().last().unwrap().clone();
+        assert_eq!(r.verdict, CallVerdict::Ok);
+        assert_eq!(r.transport, Some(Transport::Rest));
+        assert_eq!(r.manifest_version, "1.0.0");
+        assert_eq!(r.caller, "ext");
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn transport_restriction_wrong_external_surface_denied() {
+        let h = Host::new();
+        h.register(Arc::new(Echo {
+            manifest: rest_only_manifest("ro", "1.0.0"),
+            tag: "r".into(),
+        }))
+        .unwrap();
+        let g = h.issue_grant("ext", vec![], 300);
+        let e = h
+            .call_with_grant(&g, Some("ext"), Transport::Mcp, "ro", "echo", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(e.verdict, CallVerdict::Denied);
+        assert!(e.reason.contains("not declared"), "got: {}", e.reason);
+        assert!(e.reason.contains("mcp"), "got: {}", e.reason);
+        let r = h.receipts().last().unwrap().clone();
+        assert_eq!(r.transport, Some(Transport::Mcp));
+        assert!(!e.receipt_id.is_empty());
+    }
+
+    #[test]
+    fn manifest_without_transports_rejected_at_registration() {
+        // Decision (also documented in authorize()): there is no
+        // "unrestricted" manifest. Empty `transports` is fail-closed at
+        // registration, so enforcement never faces an ambiguous case.
+        let h = Host::new();
+        let mut m = test_manifest("nt", "1.0.0", vec![]);
+        m.transports = vec![];
+        let errs = h
+            .register(Arc::new(Echo { manifest: m, tag: "x".into() }))
+            .unwrap_err();
+        assert!(errs.iter().any(|x| x.field == "transports"), "got: {errs:?}");
+        assert_eq!(h.list_manifests().len(), 0);
+    }
+
+    #[test]
+    fn invocation_binding_carried_on_receipt() {
+        // The receipt carries the full bound tuple: caller identity,
+        // organelle id, resolved version, granted capabilities, transport.
+        let h = echo_host();
+        let g = h.issue_grant("ext", vec!["te.write".to_string()], 300);
+        let out = h
+            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(out["sealed"], serde_json::json!(true));
+        let r = h.receipts().last().unwrap().clone();
+        assert_eq!(r.caller, "ext");
+        assert_eq!(r.codon, "te");
+        assert_eq!(r.op, "sealed");
+        assert_eq!(r.manifest_version, "1.0.0");
+        assert_eq!(r.granted_capabilities, vec!["te.write".to_string()]);
+        assert_eq!(r.transport, Some(Transport::Native));
+        // The receipt id commits to the binding fields.
+        assert_eq!(r.compute_id(), r.id);
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn receipt_binding_immutable_and_tamper_evident() {
+        // The binding is established pre-execution and immutable after:
+        // fetched receipts are clones, and any tampering with the bound
+        // fields breaks the content address (verify_chain would fail).
+        let h = echo_host();
+        let g = h.issue_grant("ext", vec!["te.write".to_string()], 300);
+        h.call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .unwrap();
+        let stored = h.receipts().last().unwrap().clone();
+        // A hostile mutation of a fetched copy is evident: the id no
+        // longer recomputes over the tampered body.
+        let mut forged = stored.clone();
+        forged.granted_capabilities = vec!["admin.*".to_string()];
+        forged.manifest_version = "9.9.9".to_string();
+        assert_ne!(forged.compute_id(), forged.id);
+        // The stored record is untouched and the chain stays green.
+        let again = h.receipts().last().unwrap().clone();
+        assert_eq!(again.granted_capabilities, vec!["te.write".to_string()]);
+        assert_eq!(again.manifest_version, "1.0.0");
+        assert_eq!(again.transport, Some(Transport::Native));
         assert!(h.verify_chain().is_ok());
     }
 }

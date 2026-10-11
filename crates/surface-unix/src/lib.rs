@@ -80,7 +80,7 @@ fn handle_conn(host: Arc<Host>, stream: UnixStream) {
                 // Authority comes ONLY from the grant. The claimed caller
                 // identity is bound to the grant's subject inside
                 // `call_with_grant`; a missing/invalid grant is denied.
-                match host.call_with_grant(&req.grant, Some(&req.caller), &req.codon, &req.op, req.input) {
+                match host.call_with_grant(&req.grant, Some(&req.caller), organelle_manifest::Transport::UnixSocket, &req.codon, &req.op, req.input) {
                     Ok(output) => {
                         let receipt = host.receipts().last().map(|r| r.id.clone()).unwrap_or_default();
                         WireResponse { id: req.id, ok: true, output: Some(output), error: None, receipt }

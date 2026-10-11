@@ -241,7 +241,7 @@ fn handle_conn(host: Arc<Host>, mut stream: TcpStream) {
             let codon = body.get("codon").and_then(|c| c.as_str()).unwrap_or("");
             let op = body.get("op").and_then(|c| c.as_str()).unwrap_or("");
             let input = body.get("input").cloned().unwrap_or(Value::Null);
-            match host.call_with_grant(grant, caller, codon, op, input) {
+            match host.call_with_grant(grant, caller, organelle_manifest::Transport::Rest, codon, op, input) {
                 Ok(output) => {
                     let receipt = host.receipts().last().map(|r| r.id.clone()).unwrap_or_default();
                     respond(
