@@ -140,7 +140,12 @@ mod tests {
     use super::*;
     use organelle_host::Host;
 
+    // MODEL_API_URL is process-global: tests that set/remove it must not run
+    // concurrently or they flake (live test sees stub mode and vice versa).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn chat(messages: Value) -> Value {
+        let _guard = ENV_LOCK.lock().unwrap();
         let h = Host::new();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["model.call".to_string()]);
@@ -166,6 +171,7 @@ mod tests {
 
     #[test]
     fn live_provider_path_against_local_stub_server() {
+        let _guard = ENV_LOCK.lock().unwrap();
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
