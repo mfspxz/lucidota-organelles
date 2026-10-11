@@ -24,3 +24,4 @@ ref-model-call = { path = "../ref-model-call" }
 ref-file-cas = { path = "../ref-file-cas" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+hex = { workspace = true }

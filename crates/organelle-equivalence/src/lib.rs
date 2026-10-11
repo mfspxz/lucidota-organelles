@@ -15,6 +15,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod hostile;
+pub use hostile::{
+    build_hostile_cases, build_hostile_token, build_hostile_host, register_hostile_organelles,
+    run_hostile_equivalence, HostileCase, HostileExpect, HostileReport, HostileToken,
+    HostileTransportReport,
+};
+
 // ---------------------------------------------------------------------------
 // Scenario model
 // ---------------------------------------------------------------------------
@@ -50,6 +57,16 @@ pub trait TransportAdapter {
         op: &str,
         input: Value,
     ) -> Result<Value, String>;
+    /// Present a hostile case: the token is built (and attacked) against
+    /// this adapter's own host, then carried over this adapter's wire
+    /// format exactly as a real attacker would present it. For
+    /// [`HostileToken::ReplayedSingleUse`] the token is presented twice
+    /// and the SECOND verdict is returned.
+    fn hostile_call(&mut self, case: &hostile::HostileCase) -> Result<Value, String>;
+    /// The arrival transport this surface binds (never caller-supplied).
+    fn arrival(&self) -> organelle_manifest::Transport;
+    /// The most recent receipt this adapter's host emitted.
+    fn last_receipt(&self) -> Option<organelle_host::Receipt>;
 }
 
 pub struct TransportReport {
@@ -252,7 +269,28 @@ pub struct NativeAdapter {
 
 impl NativeAdapter {
     pub fn new(outbox_dir: &str, cas_dir: &str) -> Self {
-        NativeAdapter { host: build_host(outbox_dir, cas_dir) }
+        NativeAdapter { host: hostile::build_hostile_host(outbox_dir, cas_dir) }
+    }
+
+    fn present(
+        &self,
+        caller_claim: &str,
+        token: &str,
+        codon: &str,
+        op: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        self.host
+            .call_with_grant(
+                token,
+                Some(caller_claim),
+                organelle_manifest::Transport::Native,
+                codon,
+                op,
+                input,
+            )
+            .map(|ok| ok.output)
+            .map_err(|e| format!("{:?}: {}", e.verdict, e.reason))
     }
 }
 
@@ -275,6 +313,29 @@ impl TransportAdapter for NativeAdapter {
             .map(|ok| ok.output)
             .map_err(|e| format!("{:?}: {}", e.verdict, e.reason))
     }
+
+    fn hostile_call(&mut self, case: &hostile::HostileCase) -> Result<Value, String> {
+        let token = hostile::build_hostile_token(&self.host, case);
+        if case.token == hostile::HostileToken::ReplayedSingleUse {
+            // First presentation is honored; the asserted verdict is the replay's.
+            let _ = self.present(
+                case.caller_claim,
+                &token,
+                case.codon,
+                case.op,
+                case.input.clone(),
+            );
+        }
+        self.present(case.caller_claim, &token, case.codon, case.op, case.input.clone())
+    }
+
+    fn arrival(&self) -> organelle_manifest::Transport {
+        organelle_manifest::Transport::Native
+    }
+
+    fn last_receipt(&self) -> Option<organelle_host::Receipt> {
+        self.host.receipts().last().cloned()
+    }
 }
 
 pub struct UnixAdapter {
@@ -288,12 +349,44 @@ impl UnixAdapter {
     pub fn new(outbox_dir: &str, cas_dir: &str) -> Self {
         let mut path = std::env::temp_dir();
         path.push(format!("organelle-eq-{}.sock", std::process::id()));
-        let host = build_host(outbox_dir, cas_dir);
+        let host = hostile::build_hostile_host(outbox_dir, cas_dir);
         let server = surface_unix::spawn_server(host.clone(), &path)
             .expect("unix surface spawn");
         // Give the accept loop a moment to bind.
         std::thread::sleep(Duration::from_millis(50));
         UnixAdapter { host, path, next_id: 1, _server: server }
+    }
+
+    fn present(
+        &mut self,
+        caller_claim: &str,
+        token: &str,
+        codon: &str,
+        op: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        // P0: authority comes from a host-issued grant, never from
+        // caller-supplied claims on the wire.
+        let resp = surface_unix::UnixClient::call(
+            &self.path,
+            &surface_unix::WireRequest {
+                id,
+                caller: caller_claim.to_string(),
+                grant: token.to_string(),
+                codon: codon.to_string(),
+                op: op.to_string(),
+                input,
+            },
+        )
+        .map_err(|e| format!("io: {e}"))?;
+        if resp.ok {
+            resp.output.ok_or_else(|| "ok without output".to_string())
+        } else {
+            let e = resp.error.unwrap();
+            Err(format!("{}: {}", e.verdict, e.reason))
+        }
     }
 }
 
@@ -310,29 +403,30 @@ impl TransportAdapter for UnixAdapter {
         op: &str,
         input: Value,
     ) -> Result<Value, String> {
-        let id = self.next_id;
-        self.next_id += 1;
-        // P0: authority comes from a host-issued grant, never from
-        // caller-supplied claims on the wire.
         let grant = self.host.issue_grant(caller, caps.to_vec(), 300);
-        let resp = surface_unix::UnixClient::call(
-            &self.path,
-            &surface_unix::WireRequest {
-                id,
-                caller: caller.to_string(),
-                grant,
-                codon: codon.to_string(),
-                op: op.to_string(),
-                input,
-            },
-        )
-        .map_err(|e| format!("io: {e}"))?;
-        if resp.ok {
-            resp.output.ok_or_else(|| "ok without output".to_string())
-        } else {
-            let e = resp.error.unwrap();
-            Err(format!("{}: {}", e.verdict, e.reason))
+        self.present(caller, &grant, codon, op, input)
+    }
+
+    fn hostile_call(&mut self, case: &hostile::HostileCase) -> Result<Value, String> {
+        let token = hostile::build_hostile_token(&self.host, case);
+        if case.token == hostile::HostileToken::ReplayedSingleUse {
+            let _ = self.present(
+                case.caller_claim,
+                &token,
+                case.codon,
+                case.op,
+                case.input.clone(),
+            );
         }
+        self.present(case.caller_claim, &token, case.codon, case.op, case.input.clone())
+    }
+
+    fn arrival(&self) -> organelle_manifest::Transport {
+        organelle_manifest::Transport::UnixSocket
+    }
+
+    fn last_receipt(&self) -> Option<organelle_host::Receipt> {
+        self.host.receipts().last().cloned()
     }
 }
 
@@ -344,21 +438,15 @@ pub struct McpAdapter {
 
 impl McpAdapter {
     pub fn new(outbox_dir: &str, cas_dir: &str) -> Self {
-        let host = build_host(outbox_dir, cas_dir);
+        let host = hostile::build_hostile_host(outbox_dir, cas_dir);
         let tools = surface_mcp::generate_tools(&host);
         McpAdapter { host, tools, next_id: 1 }
     }
-}
 
-impl TransportAdapter for McpAdapter {
-    fn name(&self) -> &'static str {
-        "mcp"
-    }
-
-    fn call(
+    fn present(
         &mut self,
-        caller: &str,
-        caps: &[String],
+        caller_claim: &str,
+        token: &str,
         codon: &str,
         op: &str,
         input: Value,
@@ -373,11 +461,10 @@ impl TransportAdapter for McpAdapter {
         self.next_id += 1;
         // P0: the envelope carries a host-issued grant; capabilities are
         // derived from the grant, never from caller-supplied claims.
-        let grant = self.host.issue_grant(caller, caps.to_vec(), 300);
         let mut args = input;
         if let Some(obj) = args.as_object_mut() {
-            obj.insert("grant".to_string(), Value::String(grant));
-            obj.insert("caller".to_string(), Value::String(caller.to_string()));
+            obj.insert("grant".to_string(), Value::String(token.to_string()));
+            obj.insert("caller".to_string(), Value::String(caller_claim.to_string()));
         }
         let msg = serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
@@ -401,6 +488,46 @@ impl TransportAdapter for McpAdapter {
     }
 }
 
+impl TransportAdapter for McpAdapter {
+    fn name(&self) -> &'static str {
+        "mcp"
+    }
+
+    fn call(
+        &mut self,
+        caller: &str,
+        caps: &[String],
+        codon: &str,
+        op: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        let grant = self.host.issue_grant(caller, caps.to_vec(), 300);
+        self.present(caller, &grant, codon, op, input)
+    }
+
+    fn hostile_call(&mut self, case: &hostile::HostileCase) -> Result<Value, String> {
+        let token = hostile::build_hostile_token(&self.host, case);
+        if case.token == hostile::HostileToken::ReplayedSingleUse {
+            let _ = self.present(
+                case.caller_claim,
+                &token,
+                case.codon,
+                case.op,
+                case.input.clone(),
+            );
+        }
+        self.present(case.caller_claim, &token, case.codon, case.op, case.input.clone())
+    }
+
+    fn arrival(&self) -> organelle_manifest::Transport {
+        organelle_manifest::Transport::Mcp
+    }
+
+    fn last_receipt(&self) -> Option<organelle_host::Receipt> {
+        self.host.receipts().last().cloned()
+    }
+}
+
 pub struct RestAdapter {
     host: Arc<Host>,
     base: String,
@@ -409,7 +536,7 @@ pub struct RestAdapter {
 
 impl RestAdapter {
     pub fn new(outbox_dir: &str, cas_dir: &str) -> Self {
-        let host = build_host(outbox_dir, cas_dir);
+        let host = hostile::build_hostile_host(outbox_dir, cas_dir);
         let server = surface_rest::spawn(host.clone(), 0).expect("rest spawn");
         let base = server.base_url();
         std::thread::sleep(Duration::from_millis(50));
@@ -435,6 +562,29 @@ impl RestAdapter {
         let (_, resp_body) = resp.split_once("\r\n\r\n").ok_or("no body")?;
         serde_json::from_str(resp_body).map_err(|e| format!("parse: {e}"))
     }
+
+    fn present(
+        &mut self,
+        caller_claim: &str,
+        token: &str,
+        codon: &str,
+        op: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        let body = serde_json::json!({
+            "caller": caller_claim,
+            "codon": codon,
+            "op": op,
+            "input": input,
+        });
+        let resp = self.post(token, &body)?;
+        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            resp.get("output").cloned().ok_or_else(|| "ok without output".to_string())
+        } else {
+            let e = &resp["error"];
+            Err(format!("{}: {}", e["verdict"].as_str().unwrap_or("?"), e["reason"].as_str().unwrap_or("?")))
+        }
+    }
 }
 
 impl TransportAdapter for RestAdapter {
@@ -450,20 +600,30 @@ impl TransportAdapter for RestAdapter {
         op: &str,
         input: Value,
     ) -> Result<Value, String> {
-        let body = serde_json::json!({
-            "caller": caller,
-            "codon": codon,
-            "op": op,
-            "input": input,
-        });
         let grant = self.host.issue_grant(caller, caps.to_vec(), 300);
-        let resp = self.post(&grant, &body)?;
-        if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            resp.get("output").cloned().ok_or_else(|| "ok without output".to_string())
-        } else {
-            let e = &resp["error"];
-            Err(format!("{}: {}", e["verdict"].as_str().unwrap_or("?"), e["reason"].as_str().unwrap_or("?")))
+        self.present(caller, &grant, codon, op, input)
+    }
+
+    fn hostile_call(&mut self, case: &hostile::HostileCase) -> Result<Value, String> {
+        let token = hostile::build_hostile_token(&self.host, case);
+        if case.token == hostile::HostileToken::ReplayedSingleUse {
+            let _ = self.present(
+                case.caller_claim,
+                &token,
+                case.codon,
+                case.op,
+                case.input.clone(),
+            );
         }
+        self.present(case.caller_claim, &token, case.codon, case.op, case.input.clone())
+    }
+
+    fn arrival(&self) -> organelle_manifest::Transport {
+        organelle_manifest::Transport::Rest
+    }
+
+    fn last_receipt(&self) -> Option<organelle_host::Receipt> {
+        self.host.receipts().last().cloned()
     }
 }
 
