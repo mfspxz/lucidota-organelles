@@ -69,10 +69,12 @@
 
 | Repo | Host | Lang | Purpose |
 |---|---|---|---|
-| mFSpx/diogenes | GitHub | mixed | ~20 RFCs, Lucidota operator (SLOP-LAWS) |
-| mFSpx/mneme | GitHub | rust | Metacognitive agent (Voyager/Reflexion/MARS) |
-| mFSpx/legal_authority_system | GitHub | mixed | BC/Canada legal-source engine |
+| mFSpx/diogenes | GitHub (account LOST 2026-10-10 — read-only history, no pushes ever) | mixed | ~20 RFCs, Lucidota operator (SLOP-LAWS) |
+| mFSpx/mneme | GitHub (account LOST 2026-10-10 — read-only history, no pushes ever) | rust | Metacognitive agent (Voyager/Reflexion/MARS) |
+| mFSpx/legal_authority_system | GitHub (account LOST 2026-10-10 — read-only history, no pushes ever) | mixed | BC/Canada legal-source engine |
 | mfspx/doggystyle | GitLab | python | Ontological graph kernel ("State Machine of Spite" dashboard) |
+
+**Account correction (Zack, 2026-10-10):** the old GitHub account mFSpx is LOST — he will never have access again. Those 3 repos are read-only history; never attempt pushes there. His NEW GitHub account is **mfspxz** (created 2026-10-09, 23 public repos) — all remote pushes retarget there. GitLab mfspx/doggystyle unchanged.
 
 ## Migration tiers
 
