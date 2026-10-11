@@ -137,3 +137,14 @@ reasoning (qa-audit-1: the unlisted 17th repo identified as
 - `claim-reconciler` (another lane's in-flight WIP, NOT mine): 6 passed,
   4 FAILED as of 2026-10-10 — expectation mismatches in its adversarial
   tests (`"Failed"` vs `"Denied"` etc.). Not touched by this pass.
+
+## BRUTAL-AUDIT ROLLOUT ROUND 2 — LANE 1 (2026-10-10)
+
+**Scope:** resolve organelle-host/hmac build collision + CallOk API fallout.
+**Pin strategy:** hmac 0.12.1 estate-wide — see `~/workspace/dogfood/audit/rollout/HMAC-PIN-STRATEGY.md`.
+
+**This repo:**
+- Commit(s): 476aa4d + fad22bb
+- Tests: claim-reconciler 15/15 (5 unit + 10 adversarial); ref-model-call 4/4 x3 runs
+- Change: claim-reconciler tests indexed CallOk as Value (pre-380ed26 API) -> X[".."] => X.output[".."], ingest_claim returns .unwrap().output. ref-model-call live-provider test flaked on MODEL_API_URL env race between parallel tests -> static ENV_LOCK Mutex serializing env-mutating tests.
+- Method: mechanical, test-only, zero behavior change. Selective staging; lane WIP (if any) left untouched.
