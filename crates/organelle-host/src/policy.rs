@@ -327,6 +327,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    // -- WIRE-1 (LUCIDOTA P0, Letta Code v0.34.24 sibling-prefix fix) -----
+    // The overlay package shipped these as an integration test using
+    // `organelle_host::policy::resolve_write_path`, but `policy` is a
+    // private module (lib.rs: `mod policy;`), so that form cannot
+    // compile. They are wired here as unit tests instead, which keeps
+    // the module boundary unchanged. Source: the 2026-10-25 security
+    // package (lucidota-security-p0-2026-10-25.zip, policy_regression.rs).
+
+    #[test]
+    fn sibling_prefix_is_not_containment() {
+        // Letta's flaw: permitting /x/project inadvertently permitted
+        // /x/project-private via a raw string-prefix check. Rust's
+        // Path::starts_with is component-aware, so this must stay denied.
+        let base = tmp_root("wsib");
+        let allowed = base.join("project");
+        let sibling = base.join("project-private");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let root = allowed.canonicalize().unwrap();
+        let bad = sibling.join("secret.txt");
+        let e = resolve_write_path(std::slice::from_ref(&root), bad.to_str().unwrap()).unwrap_err();
+        assert!(e.contains("outside all approved write roots"), "{e}");
+        // And the real project path itself must still be allowed.
+        let good = allowed.join("secret.txt");
+        assert!(resolve_write_path(std::slice::from_ref(&root), good.to_str().unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_with_nonexistent_target_denied() {
+        // A symlink inside the root pointing outside must stay denied
+        // even when the final path components do not exist yet (the
+        // resolver walks to the nearest existing ancestor, which is the
+        // symlink itself, and canonicalizes through it).
+        let base = tmp_root("wsym-non");
+        let allowed = base.join("allowed");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
+        let bad = allowed.join("link").join("new").join("sub").join("file.txt");
+        let e = resolve_write_path(
+            std::slice::from_ref(&allowed.canonicalize().unwrap()),
+            bad.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(e.contains("outside all approved write roots"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn nonexistent_root_never_matches() {
         // A root that was deleted after being configured still resolves

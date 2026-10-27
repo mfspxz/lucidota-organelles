@@ -157,6 +157,261 @@ impl ReceiptLog {
     }
 }
 
+/// Host-side view of the dispatch effect-state file (see
+/// `fabric-dispatch::idem::DurableEffectLog` for the writer and the full
+/// protocol docs).
+///
+/// WHY THIS EXISTS, AND WHY IT IS NOT A SECOND SOURCE OF TRUTH: the
+/// receipt chain (ORL1, above) is the sole receipt truth, but a receipt
+/// only exists AFTER an effect completes. The gap between "effect
+/// attempted" and "receipt durable" is exactly where duplicate external
+/// sends are born. This file is the sole EFFECT-STATE truth for a
+/// deployment: one file, written by the dispatcher and readable here,
+/// correlated to receipts by idempotency key. Both sides replay the
+/// SAME file with the SAME record schema (`op`/`key`/`reserved_ms`/
+/// `receipt.result_digest`/`provider_id`); extra fields (effect kind,
+/// task id, attempt) are ignored on read. There are not two effect
+/// stores — there is one file with two crate-side views of it.
+///
+/// States mirror the dispatch side: UNKNOWN (reserved, outcome unknown —
+/// reconcile, never blindly re-execute) and PROVEN (confirmed with a
+/// digest; a conflicting digest is refused).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostEffectState {
+    Unknown { reserved_ms: u64 },
+    Proven {
+        result_digest: String,
+        provider_id: Option<String>,
+    },
+}
+
+/// One effect-state record as written to the file. Only the fields this
+/// side needs are modeled; everything else is ignored on read.
+#[derive(Debug, Deserialize)]
+struct EffectFileRecord {
+    op: String,
+    key: String,
+    #[serde(default)]
+    reserved_ms: u64,
+    #[serde(default)]
+    receipt: Option<EffectFileReceipt>,
+    #[serde(default)]
+    provider_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EffectFileReceipt {
+    result_digest: String,
+}
+
+/// File-backed effect-state log: append-only JSONL, fsync'd before a
+/// transition is reported done. Torn-final-line repair mirrors
+/// [`ReceiptLog`]: a crash mid-append truncates, a complete-but-bad
+/// record fails closed.
+pub struct EffectStateLog {
+    file: File,
+    pub path: PathBuf,
+    states: std::collections::HashMap<String, HostEffectState>,
+}
+
+impl EffectStateLog {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|e| format!("effect log open {}: {e}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("effect log read {}: {e}", path.display()))?;
+        let mut states = std::collections::HashMap::new();
+        let mut offset = 0usize;
+        let mut good_end = 0usize;
+        for line in bytes.split_inclusive(|b| *b == b'\n') {
+            let line_start = offset;
+            offset += line.len();
+            let text = match std::str::from_utf8(line) {
+                Ok(t) => t.trim_end_matches(['\n', '\r']),
+                Err(_) => break, // torn non-UTF8 tail: truncate below
+            };
+            if text.is_empty() {
+                good_end = offset;
+                continue;
+            }
+            let rec: EffectFileRecord = match serde_json::from_str(text) {
+                Ok(r) => r,
+                Err(_) => {
+                    let torn_tail = offset >= bytes.len() && !line.ends_with(b"\n");
+                    if torn_tail {
+                        break;
+                    }
+                    return Err(format!(
+                        "effect log {}: unparseable record at byte {line_start}: \
+                         corruption — refusing to load",
+                        path.display()
+                    ));
+                }
+            };
+            match rec.op.as_str() {
+                "reserve" => match states.get(&rec.key) {
+                    Some(HostEffectState::Proven { .. }) => {
+                        return Err(format!(
+                            "effect log {}: reserve replay for already-proven key {}",
+                            path.display(),
+                            rec.key
+                        ));
+                    }
+                    _ => {
+                        states.entry(rec.key).or_insert(HostEffectState::Unknown {
+                            reserved_ms: rec.reserved_ms,
+                        });
+                    }
+                },
+                "confirm" => {
+                    let receipt = rec.receipt.ok_or_else(|| {
+                        format!(
+                            "effect log {}: confirm record without receipt for key {}",
+                            path.display(),
+                            rec.key
+                        )
+                    })?;
+                    match states.get(&rec.key) {
+                        None => {
+                            return Err(format!(
+                                "effect log {}: confirm replay for never-reserved key {}",
+                                path.display(),
+                                rec.key
+                            ));
+                        }
+                        Some(HostEffectState::Proven { result_digest, .. })
+                            if *result_digest != receipt.result_digest =>
+                        {
+                            return Err(format!(
+                                "effect log {}: conflicting confirm for key {}",
+                                path.display(),
+                                rec.key
+                            ));
+                        }
+                        Some(HostEffectState::Proven { .. }) => {}
+                        Some(HostEffectState::Unknown { .. }) => {
+                            states.insert(
+                                rec.key.clone(),
+                                HostEffectState::Proven {
+                                    result_digest: receipt.result_digest,
+                                    provider_id: rec.provider_id,
+                                },
+                            );
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "effect log {}: unknown record op {other:?} at byte {line_start}",
+                        path.display()
+                    ));
+                }
+            }
+            good_end = offset;
+        }
+        if good_end < bytes.len() {
+            file.set_len(good_end as u64)
+                .map_err(|e| format!("effect log truncate {}: {e}", path.display()))?;
+            file.sync_all()
+                .map_err(|e| format!("effect log fsync after truncate {}: {e}", path.display()))?;
+        }
+        file.seek(SeekFrom::End(0))
+            .map_err(|e| format!("effect log seek {}: {e}", path.display()))?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            states,
+        })
+    }
+
+    fn append_record(&mut self, line: &str) -> Result<(), String> {
+        self.file
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("effect log write {}: {e}", self.path.display()))?;
+        self.file
+            .sync_all()
+            .map_err(|e| format!("effect log fsync {}: {e}", self.path.display()))?;
+        Ok(())
+    }
+
+    /// Reserve intent durably before an outbound effect. Re-reserving an
+    /// UNKNOWN key is a no-op returning its existing state; reserving a
+    /// PROVEN key returns the proven state (do not re-execute). If the
+    /// fsync'd append fails, NO reservation is recorded in memory: the
+    /// caller must not send, because a crash would leave no UNKNOWN
+    /// marker to reconcile against.
+    pub fn reserve(
+        &mut self,
+        key: &str,
+        reserved_ms: u64,
+    ) -> Result<HostEffectState, String> {
+        match self.states.get(key) {
+            Some(s) => Ok(s.clone()),
+            None => {
+                let line = serde_json::json!({
+                    "op": "reserve", "key": key, "reserved_ms": reserved_ms,
+                })
+                .to_string()
+                    + "\n";
+                self.append_record(&line)?;
+                let s = HostEffectState::Unknown { reserved_ms };
+                self.states.insert(key.to_string(), s.clone());
+                Ok(s)
+            }
+        }
+    }
+
+    /// Confirm (reconcile) an UNKNOWN effect with the provider's digest.
+    /// Refuses unreserved keys and conflicting digests. Same digest over
+    /// a PROVEN key is an idempotent no-op.
+    pub fn confirm(
+        &mut self,
+        key: &str,
+        result_digest: &str,
+        provider_id: Option<&str>,
+    ) -> Result<HostEffectState, String> {
+        match self.states.get(key) {
+            None => Err(format!(
+                "cannot confirm effect {key} that was never reserved"
+            )),
+            Some(HostEffectState::Proven {
+                result_digest: prev,
+                ..
+            }) if prev != result_digest => Err(format!(
+                "conflicting confirm for key {key}: first digest wins"
+            )),
+            Some(HostEffectState::Proven { .. }) => {
+                Ok(self.states.get(key).unwrap().clone())
+            }
+            Some(HostEffectState::Unknown { .. }) => {
+                let line = serde_json::json!({
+                    "op": "confirm", "key": key,
+                    "receipt": { "result_digest": result_digest },
+                    "provider_id": provider_id,
+                })
+                .to_string()
+                    + "\n";
+                self.append_record(&line)?;
+                let s = HostEffectState::Proven {
+                    result_digest: result_digest.to_string(),
+                    provider_id: provider_id.map(|p| p.to_string()),
+                };
+                self.states.insert(key.to_string(), s.clone());
+                Ok(s)
+            }
+        }
+    }
+
+    pub fn state(&self, key: &str) -> Option<&HostEffectState> {
+        self.states.get(key)
+    }
+}
+
 /// Scan the log, validate every record, truncate a torn tail. Returns the
 /// recovered receipts in file order. Any fully-written record that fails
 /// to parse or fails integrity checks is an `Err` (fail-closed): it is
@@ -335,4 +590,101 @@ fn file_len(file: &File, path: &Path) -> Result<u64, String> {
     file.metadata()
         .map(|m| m.len())
         .map_err(|e| format!("receipt log stat {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod effect_state_tests {
+    use super::*;
+
+    fn tmp_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lucidota-host-effects-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{tag}.jsonl"))
+    }
+
+    #[test]
+    fn crash_recovery_reconciles_instead_of_repeating() {
+        let path = tmp_path("crash");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut log = EffectStateLog::open(&path).unwrap();
+            // Reserve durably before the (simulated) send; then crash:
+            // drop without confirm.
+            assert_eq!(
+                log.reserve("ext:send-123", 1000).unwrap(),
+                HostEffectState::Unknown { reserved_ms: 1000 }
+            );
+        }
+        let mut log = EffectStateLog::open(&path).unwrap();
+        // After restart: UNKNOWN, not absent (absent would invite a
+        // blind re-send) and not proven.
+        assert_eq!(
+            log.state("ext:send-123"),
+            Some(&HostEffectState::Unknown { reserved_ms: 1000 })
+        );
+        // Reconcile with the provider's digest instead of re-sending.
+        let proven = log
+            .confirm("ext:send-123", "sha256:provider-receipt", Some("provider:msg-123"))
+            .unwrap();
+        assert_eq!(
+            proven,
+            HostEffectState::Proven {
+                result_digest: "sha256:provider-receipt".to_string(),
+                provider_id: Some("provider:msg-123".to_string()),
+            }
+        );
+        // Blind retry with a different digest is refused.
+        assert!(log
+            .confirm("ext:send-123", "sha256:second-send", None)
+            .is_err());
+        // Confirming a never-reserved key is refused.
+        assert!(log.confirm("never-reserved", "sha256:x", None).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reads_dispatch_schema_records() {
+        // The dispatch writer's records carry extra fields (effect kind,
+        // task id, attempt, full receipt object); the host reader must
+        // replay them from the SAME file without choking on extras.
+        let path = tmp_path("dispatch-schema");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "{\"op\":\"reserve\",\"key\":\"ext:1\",\"effect\":\"EXTERNAL_POST\",\"task_id\":\"T001\",\"attempt\":1,\"reserved_ms\":42}\n\
+             {\"op\":\"confirm\",\"key\":\"ext:1\",\"receipt\":{\"key\":\"ext:1\",\"effect\":\"EXTERNAL_POST\",\"task_id\":\"T001\",\"attempt\":1,\"performed_ms\":43,\"result_digest\":\"sha256:abc\"},\"provider_id\":\"provider:1\"}\n",
+        )
+        .unwrap();
+        let log = EffectStateLog::open(&path).unwrap();
+        assert_eq!(
+            log.state("ext:1"),
+            Some(&HostEffectState::Proven {
+                result_digest: "sha256:abc".to_string(),
+                provider_id: Some("provider:1".to_string()),
+            })
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn torn_tail_truncated_on_reopen() {
+        let path = tmp_path("torn");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut log = EffectStateLog::open(&path).unwrap();
+            log.reserve("torn:1", 7).unwrap();
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"{\"op\":\"reserve\",\"key\":\"tor").unwrap();
+            f.sync_all().unwrap();
+        }
+        let log = EffectStateLog::open(&path).unwrap();
+        assert_eq!(
+            log.state("torn:1"),
+            Some(&HostEffectState::Unknown { reserved_ms: 7 })
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
