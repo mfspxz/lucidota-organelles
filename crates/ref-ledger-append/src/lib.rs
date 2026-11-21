@@ -51,7 +51,9 @@ pub struct LedgerAppend {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(LedgerAppend { manifest: manifest() })
+    Arc::new(LedgerAppend {
+        manifest: manifest(),
+    })
 }
 
 impl Organelle for LedgerAppend {
@@ -102,7 +104,10 @@ mod tests {
 
     fn tmp_path(tag: &str) -> String {
         let mut p = std::env::temp_dir();
-        p.push(format!("organelle-la-test-{tag}-{}.jsonl", std::process::id()));
+        p.push(format!(
+            "organelle-la-test-{tag}-{}.jsonl",
+            std::process::id()
+        ));
         p.to_string_lossy().into_owned()
     }
 
@@ -123,7 +128,12 @@ mod tests {
         let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
         let entry = serde_json::json!({"b": 2, "a": 1});
         let out = h
-            .call(&ctx, "la", "append", serde_json::json!({"entry": entry, "ledger_path": path}))
+            .call(
+                &ctx,
+                "la",
+                "append",
+                serde_json::json!({"entry": entry, "ledger_path": path}),
+            )
             .unwrap();
         assert_eq!(out.output["ok"], serde_json::json!(true));
         assert_eq!(out.output["created"], serde_json::json!(true));
@@ -133,7 +143,12 @@ mod tests {
         assert_eq!(disk, "{\"a\":1,\"b\":2}\n");
         // Second append: created=false.
         let out2 = h
-            .call(&ctx, "la", "append", serde_json::json!({"entry": {"x": 1}, "ledger_path": path}))
+            .call(
+                &ctx,
+                "la",
+                "append",
+                serde_json::json!({"entry": {"x": 1}, "ledger_path": path}),
+            )
             .unwrap();
         assert_eq!(out2.output["created"], serde_json::json!(false));
         let _ = std::fs::remove_file(&path);
@@ -145,8 +160,12 @@ mod tests {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
         let e = h
-            .call(&ctx, "la", "append",
-                serde_json::json!({"entry": {}, "ledger_path": "/tmp/../evil.jsonl"}))
+            .call(
+                &ctx,
+                "la",
+                "append",
+                serde_json::json!({"entry": {}, "ledger_path": "/tmp/../evil.jsonl"}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
         assert!(e.reason.contains(".."), "{}", e.reason);
@@ -165,8 +184,12 @@ mod tests {
         let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
         let outside = tmp_path("outside");
         let e = h
-            .call(&ctx, "la", "append",
-                serde_json::json!({"entry": {"x": 1}, "ledger_path": outside}))
+            .call(
+                &ctx,
+                "la",
+                "append",
+                serde_json::json!({"entry": {"x": 1}, "ledger_path": outside}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
         assert!(e.reason.contains("denied"), "{}", e.reason);
@@ -184,8 +207,12 @@ mod tests {
         let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
         let path = tmp_path("noroot");
         let e = h
-            .call(&ctx, "la", "append",
-                serde_json::json!({"entry": {"x": 1}, "ledger_path": path}))
+            .call(
+                &ctx,
+                "la",
+                "append",
+                serde_json::json!({"entry": {"x": 1}, "ledger_path": path}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
         assert!(e.reason.contains("default deny"), "{}", e.reason);
@@ -211,9 +238,13 @@ mod tests {
         let ctx = CallContext::new("test", vec!["ledger.write".to_string()]);
         let via_link = root.join("link").join("evil.jsonl");
         let e = h
-            .call(&ctx, "la", "append",
+            .call(
+                &ctx,
+                "la",
+                "append",
                 serde_json::json!({"entry": {"x": 1},
-                    "ledger_path": via_link.to_string_lossy()}))
+                    "ledger_path": via_link.to_string_lossy()}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
         assert!(e.reason.contains("denied"), "{}", e.reason);
@@ -228,8 +259,12 @@ mod tests {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h
-            .call(&ctx, "la", "append",
-                serde_json::json!({"entry": {}, "ledger_path": tmp_path("denied")}))
+            .call(
+                &ctx,
+                "la",
+                "append",
+                serde_json::json!({"entry": {}, "ledger_path": tmp_path("denied")}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Denied);
     }

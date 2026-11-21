@@ -1,0 +1,15 @@
+[package]
+name = "ref-typed-hash"
+version = "1.0.0"
+edition = "2021"
+description = "GO-50 Phase 1 (family F3): reference typed organelle — typed hash (codon th), mirrors ref-hash-seal over the typed fabric"
+
+[dependencies]
+organelle-manifest = { workspace = true }
+organelle-host = { workspace = true }
+organelle-typed = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+ref-hash-seal = { path = "../ref-hash-seal" }

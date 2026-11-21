@@ -37,7 +37,7 @@ use std::sync::{
 };
 
 mod authority;
-pub use authority::{GrantError, GrantErrorKind, VerifiedGrant};
+pub use authority::{GrantAuthority, GrantError, GrantErrorKind, VerifiedGrant};
 mod policy;
 pub use policy::{EgressPolicy, HostPattern};
 mod receipt_log;
@@ -56,7 +56,10 @@ pub struct OrganelleError {
 
 impl OrganelleError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        OrganelleError { code, message: message.into() }
+        OrganelleError {
+            code,
+            message: message.into(),
+        }
     }
     pub fn failed(message: impl Into<String>) -> Self {
         Self::new("failed", message)
@@ -134,6 +137,16 @@ pub trait HostRef: Send + Sync {
     /// allowlist denies everything. The denial names only the URL's host,
     /// never the full URL (query strings may carry secrets).
     fn approve_egress(&self, url: &str) -> Result<(), OrganelleError>;
+
+    /// Record the typed-layer outcome for the invocation running under
+    /// `trace_id` (GO-50 Phase 1, family F3). Called by a typed
+    /// organelle's erased adapter after successful typed execution;
+    /// `typed` is `{"truth": ..., "provenance": ...}` with claim truth
+    /// and payload provenance as separate fields. The host attaches it
+    /// to the invocation receipt. Default: no-op, so existing `HostRef`
+    /// implementations (test fakes, other hosts) keep compiling; the
+    /// real host stores it for `invoke_resolved` to consume.
+    fn record_typed_outcome(&self, _trace_id: &str, _typed: Value) {}
 }
 
 /// The organelle contract, mirroring `ToolOrganelle::handle`.
@@ -298,6 +311,16 @@ pub struct Receipt {
     pub output_hash: String,
     pub verdict: CallVerdict,
     pub valence: Valence,
+    /// Typed-layer outcome (GO-50 Phase 1, family F3):
+    /// `{"truth": ..., "provenance": ...}` as recorded by a typed
+    /// organelle's erased adapter via `HostRef::record_typed_outcome`.
+    /// `None` for untyped invocations and all pre-F3 receipts. Claim
+    /// truth and payload provenance are separate fields inside this
+    /// value, never collapsed into one valence. Covered by the receipt
+    /// id hash when present (see `body_json`: absent when `None`, so
+    /// pre-F3 receipt ids recompute exactly).
+    #[serde(default)]
+    pub typed_outcome: Option<Value>,
     /// Previous receipt id, or "GENESIS".
     pub prev: String,
     pub note: Option<String>,
@@ -305,7 +328,7 @@ pub struct Receipt {
 
 impl Receipt {
     fn body_json(&self) -> Value {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "ts": self.ts, "seq": self.seq, "kind": self.kind,
             "codon": self.codon, "op": self.op,
             "manifest_version": self.manifest_version,
@@ -316,7 +339,14 @@ impl Receipt {
             "output_hash": self.output_hash, "verdict": self.verdict,
             "valence": self.valence, "prev": self.prev,
             "note": self.note,
-        })
+        });
+        // The typed outcome is hashed only when present: pre-F3
+        // receipts (`None`) keep their exact original body, so old
+        // chains still verify after this field lands.
+        if let Some(t) = &self.typed_outcome {
+            body["typed_outcome"] = t.clone();
+        }
+        body
     }
 
     fn compute_id(&self) -> String {
@@ -350,7 +380,11 @@ pub struct CallError {
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {} (receipt {})", self.verdict, self.reason, self.receipt_id)
+        write!(
+            f,
+            "{:?}: {} (receipt {})",
+            self.verdict, self.reason, self.receipt_id
+        )
     }
 }
 
@@ -433,9 +467,42 @@ struct HostInner {
     /// traces may exercise at most the intersection of the calling
     /// organelle's manifest grants and this domain — a grant for capability
     /// X cannot be escalated to capability Y through a nested call (P1
-    /// lane 3). Trace ids are never reused, so an entry that leaks (panic
-    /// in a handler) cannot authorize any other invocation.
+    /// lane 3). A leaked entry (panic in a handler — F6-H4-adjacent,
+    /// deferred) can only narrow a later call under a reused trace id,
+    /// never widen it: the domain is consulted as an intersection, so
+    /// a stale entry over-restricts, it cannot authorize.
     grant_domains: HashMap<String, Vec<String>>,
+    /// Typed-outcome stash (GO-50 Phase 1, family F3): trace_id ->
+    /// `{"truth": ..., "provenance": ...}` recorded by a typed
+    /// organelle's erased adapter during `handle()`; consumed by
+    /// `invoke_resolved` when it emits the invocation receipt. Entries
+    /// are taken (removed) on every path out of `invoke_resolved`,
+    /// including a handler panic — a `TypedOutcomeGuard` removes the
+    /// entry on unwind (F6-H4). Without the guard, a panic after
+    /// recording leaked the entry, and trace ids ARE reusable on the
+    /// native path (the dispatcher honors caller-supplied trace ids),
+    /// so a later call could pick up another invocation's truth and
+    /// provenance.
+    typed_outcomes: HashMap<String, Value>,
+}
+
+/// F6-H4: removes the typed-outcome stash entry for one trace id
+/// when dropped — including on unwind. Created in `invoke_resolved`
+/// before `handle()` runs; on the normal path the explicit remove
+/// below takes the entry first and the guard's drop is a no-op. The
+/// drop never unwraps the lock: a poisoned lock must not turn a
+/// panic into an abort.
+struct TypedOutcomeGuard<'a> {
+    host: &'a Host,
+    trace_id: String,
+}
+
+impl Drop for TypedOutcomeGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.host.inner.write() {
+            inner.typed_outcomes.remove(&self.trace_id);
+        }
+    }
 }
 
 /// parkwreck-organelle-host. Share via `Arc<Host>`; all methods take `&self`.
@@ -461,6 +528,7 @@ impl Host {
                 write_roots: Vec::new(),
                 egress: EgressPolicy::deny_all(),
                 grant_domains: HashMap::new(),
+                typed_outcomes: HashMap::new(),
             }),
         })
     }
@@ -538,6 +606,7 @@ impl Host {
             output_hash,
             verdict,
             valence,
+            typed_outcome: None,
             prev: String::new(),
             note,
         }
@@ -548,6 +617,19 @@ impl Host {
         self.inner.read().unwrap().receipts.clone()
     }
 
+    /// The receipt with this id, if the host has emitted it. The typed
+    /// dispatcher (GO-50 F3) uses this to read a typed outcome back
+    /// from its invocation's receipt without cloning the whole chain.
+    pub fn receipt_by_id(&self, id: &str) -> Option<Receipt> {
+        self.inner
+            .read()
+            .unwrap()
+            .receipts
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+    }
+
     /// Verify the receipt chain offline: every id recomputes, every `prev`
     /// links, seq is strictly increasing. Returns number of receipts verified.
     pub fn verify_chain(&self) -> Result<usize, String> {
@@ -555,7 +637,10 @@ impl Host {
         let mut prev = "GENESIS".to_string();
         for (i, r) in inner.receipts.iter().enumerate() {
             if r.compute_id() != r.id {
-                return Err(format!("receipt {i} (seq {}): id does not recompute", r.seq));
+                return Err(format!(
+                    "receipt {i} (seq {}): id does not recompute",
+                    r.seq
+                ));
             }
             if r.prev != prev {
                 return Err(format!("receipt {i} (seq {}): chain break", r.seq));
@@ -614,15 +699,13 @@ impl Host {
                 }
                 ([], mem) => {
                     for r in mem {
-                        log.append(r).map_err(|e| {
-                            format!("receipt log adopt in-memory chain: {e}")
-                        })?;
+                        log.append(r)
+                            .map_err(|e| format!("receipt log adopt in-memory chain: {e}"))?;
                     }
                     inner.receipt_log = Some(log);
                 }
                 (disk, []) => {
-                    inner.receipt_seq =
-                        disk.iter().map(|r| r.seq).max().unwrap_or(0);
+                    inner.receipt_seq = disk.iter().map(|r| r.seq).max().unwrap_or(0);
                     inner.receipts = disk.to_vec();
                     inner.receipt_log = Some(log);
                 }
@@ -630,15 +713,12 @@ impl Host {
                     let same = disk.len() == mem.len()
                         && disk.iter().zip(mem.iter()).all(|(a, b)| a.id == b.id);
                     if !same {
-                        return Err(
-                            "receipt log chain does not match in-memory chain \
+                        return Err("receipt log chain does not match in-memory chain \
                              (two writers sharing one log, or a foreign log): \
                              refusing to attach"
-                                .to_string(),
-                        );
+                            .to_string());
                     }
-                    inner.receipt_seq =
-                        disk.iter().map(|r| r.seq).max().unwrap_or(0);
+                    inner.receipt_seq = disk.iter().map(|r| r.seq).max().unwrap_or(0);
                     inner.receipt_log = Some(log);
                 }
             }
@@ -698,8 +778,8 @@ impl Host {
             policy::resolve_write_path(&inner.write_roots, raw)?
         };
         let anchor = self.export_anchor()?;
-        let bytes = serde_json::to_vec_pretty(&anchor)
-            .map_err(|e| format!("anchor serialize: {e}"))?;
+        let bytes =
+            serde_json::to_vec_pretty(&anchor).map_err(|e| format!("anchor serialize: {e}"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("anchor: cannot create parent dir: {e}"))?;
@@ -837,7 +917,11 @@ impl Host {
             .organelles
             .get(codon)
             .ok_or_else(|| format!("unknown organelle codon \"{codon}\""))?;
-        let policy = inner.routes.get(codon).cloned().unwrap_or(RoutePolicy::Latest);
+        let policy = inner
+            .routes
+            .get(codon)
+            .cloned()
+            .unwrap_or(RoutePolicy::Latest);
         let idx = match policy {
             RoutePolicy::Latest => versions.len() - 1,
             RoutePolicy::Pinned(v) => versions
@@ -955,7 +1039,10 @@ impl Host {
             sha256_hex(&checkpoint.bytes),
             CallVerdict::Ok,
             Valence::Proven,
-            Some(format!("killed {codon}; final checkpoint {} bytes", checkpoint.bytes.len())),
+            Some(format!(
+                "killed {codon}; final checkpoint {} bytes",
+                checkpoint.bytes.len()
+            )),
         ));
         Ok(())
     }
@@ -1006,18 +1093,26 @@ impl Host {
                     }
                 } else {
                     match self.resolve_locked(&inner, codon, &ctx.trace_id) {
-                        Ok((_, e)) => self.authorize(&e.manifest, &e.organelle, ctx, op, &input, arrival),
+                        Ok((_, e)) => {
+                            self.authorize(&e.manifest, &e.organelle, ctx, op, &input, arrival)
+                        }
                         Err(reason) => Gate2::Stop { reason },
                     }
                 }
             } else {
                 match self.resolve_locked(&inner, codon, &ctx.trace_id) {
-                    Ok((_, e)) => self.authorize(&e.manifest, &e.organelle, ctx, op, &input, arrival),
+                    Ok((_, e)) => {
+                        self.authorize(&e.manifest, &e.organelle, ctx, op, &input, arrival)
+                    }
                     Err(reason) => Gate2::Stop { reason },
                 }
             };
             match gate {
-                Gate2::Go { manifest, organelle, version } => Ok(ResolvedCall {
+                Gate2::Go {
+                    manifest,
+                    organelle,
+                    version,
+                } => Ok(ResolvedCall {
                     binding: InvocationBinding {
                         caller: ctx.caller.clone(),
                         codon: codon.to_string(),
@@ -1066,7 +1161,11 @@ impl Host {
                     Valence::Candidate,
                     Some(reason.clone()),
                 ));
-                Err(CallError { verdict: v, reason, receipt_id })
+                Err(CallError {
+                    verdict: v,
+                    reason,
+                    receipt_id,
+                })
             }
             Ok(rc) => self.invoke_resolved(ctx, rc, input),
         }
@@ -1084,6 +1183,13 @@ impl Host {
         input: Value,
     ) -> Result<CallOk, CallError> {
         let binding = rc.binding.clone();
+        // F6-H4: the stash entry must not outlive this invocation even
+        // if handle() panics — the guard removes it on unwind (on the
+        // normal path the explicit remove below takes it first).
+        let _typed_guard = TypedOutcomeGuard {
+            host: self,
+            trace_id: ctx.trace_id.clone(),
+        };
         let (verdict, output_hash, valence, note, result): (
             CallVerdict,
             String,
@@ -1110,7 +1216,22 @@ impl Host {
                 }),
             ),
         };
-        let receipt_id = self.emit_receipt(Self::receipt_shell(
+        // GO-50 F3: a typed organelle's adapter records its truth +
+        // provenance under this trace id during handle(); attach it to
+        // the receipt on success. Taken (removed) on every path so the
+        // stash never outlives the invocation; the guard above covers
+        // the panic path too (F6-H4). Untyped invocations record
+        // nothing and get None, exactly like pre-F3 receipts.
+        // A failed invocation never carries a typed outcome: the
+        // adapter records only after successful typed execution, and a
+        // stale entry (buggy adapter) is dropped, not attached.
+        let typed_outcome = self
+            .inner
+            .write()
+            .unwrap()
+            .typed_outcomes
+            .remove(&ctx.trace_id);
+        let mut receipt = Self::receipt_shell(
             ReceiptKind::Invocation,
             &binding,
             &input,
@@ -1118,7 +1239,11 @@ impl Host {
             verdict,
             valence,
             note,
-        ));
+        );
+        if verdict == CallVerdict::Ok {
+            receipt.typed_outcome = typed_outcome;
+        }
+        let receipt_id = self.emit_receipt(receipt);
         match result {
             Ok(output) => Ok(CallOk { output, receipt_id }),
             Err(mut e) => {
@@ -1208,9 +1333,10 @@ impl Host {
     pub fn set_write_roots(&self, roots: Vec<PathBuf>) -> Result<(), String> {
         let mut canon = Vec::with_capacity(roots.len());
         for r in &roots {
-            canon.push(r.canonicalize().map_err(|e| {
-                format!("write root {}: cannot canonicalize: {e}", r.display())
-            })?);
+            canon
+                .push(r.canonicalize().map_err(|e| {
+                    format!("write root {}: cannot canonicalize: {e}", r.display())
+                })?);
         }
         self.inner.write().unwrap().write_roots = canon;
         Ok(())
@@ -1278,9 +1404,7 @@ impl Host {
                     op,
                     &input,
                     Some(transport),
-                    format!(
-                        "caller claim \"{claim}\" does not match grant subject"
-                    ),
+                    format!("caller claim \"{claim}\" does not match grant subject"),
                 ));
             }
         }
@@ -1391,8 +1515,7 @@ impl Host {
         // "unrestricted" case — every registered organelle declares >= 1.
         if let Some(t) = arrival {
             if !m.transports.contains(&t) {
-                let declared: Vec<&str> =
-                    m.transports.iter().map(|x| x.as_str()).collect();
+                let declared: Vec<&str> = m.transports.iter().map(|x| x.as_str()).collect();
                 return Gate2::Stop {
                     reason: format!(
                         "transport \"{}\" not declared for {}@{} (declared: {})",
@@ -1409,10 +1532,7 @@ impl Host {
         if let Some(need) = cap {
             if !ctx.has(need) {
                 return Gate2::Stop {
-                    reason: format!(
-                        "missing capability \"{need}\" for {}.{op}",
-                        m.codon
-                    ),
+                    reason: format!("missing capability \"{need}\" for {}.{op}", m.codon),
                 };
             }
         }
@@ -1480,10 +1600,7 @@ impl Host {
             // (native surface) keep the org-011 membrane identity model:
             // the organelle's manifest grants govern, unchanged.
             let outer_grant_caps = inner.grant_domains.get(caller_trace).cloned();
-            let manifest_grants = caller_manifest
-                .authority
-                .granted_capabilities
-                .clone();
+            let manifest_grants = caller_manifest.authority.granted_capabilities.clone();
             let (effective_grants, confined) = match outer_grant_caps {
                 Some(gcaps) => (
                     manifest_grants
@@ -1556,14 +1673,18 @@ impl Host {
                     Valence::Candidate,
                     Some(reason.clone()),
                 ));
-                self.inner.write().unwrap().boundary_denials.push(BoundaryDenial {
-                    ts: utc_now_iso(),
-                    caller_codon: caller_codon.to_string(),
-                    target_codon: codon.to_string(),
-                    op: op.to_string(),
-                    reason: reason.clone(),
-                    receipt_id: rid,
-                });
+                self.inner
+                    .write()
+                    .unwrap()
+                    .boundary_denials
+                    .push(BoundaryDenial {
+                        ts: utc_now_iso(),
+                        caller_codon: caller_codon.to_string(),
+                        target_codon: codon.to_string(),
+                        op: op.to_string(),
+                        reason: reason.clone(),
+                        receipt_id: rid,
+                    });
                 return Err(OrganelleError::denied(reason));
             }
         }
@@ -1613,11 +1734,7 @@ impl Host {
                         .invoke_resolved(&ctx, callee, input)
                         .map(|ok| ok.output)
                         .map_err(|e| OrganelleError::new("denied", e.reason));
-                    self.inner
-                        .write()
-                        .unwrap()
-                        .grant_domains
-                        .remove(&trace);
+                    self.inner.write().unwrap().grant_domains.remove(&trace);
                     result
                 } else {
                     self.invoke_resolved(&ctx, callee, input)
@@ -1761,7 +1878,11 @@ impl Host {
                     return Err("split routing needs >= 2 versions".to_string());
                 }
             }
-            let prev = inner.routes.get(codon).cloned().unwrap_or(RoutePolicy::Latest);
+            let prev = inner
+                .routes
+                .get(codon)
+                .cloned()
+                .unwrap_or(RoutePolicy::Latest);
             inner
                 .route_history
                 .entry(codon.to_string())
@@ -1853,6 +1974,14 @@ impl HostRef for Host {
                 "egress denied: host \"{host}\" not in allowlist"
             )))
         }
+    }
+
+    fn record_typed_outcome(&self, trace_id: &str, typed: Value) {
+        self.inner
+            .write()
+            .unwrap()
+            .typed_outcomes
+            .insert(trace_id.to_string(), typed);
     }
 }
 
@@ -1995,8 +2124,11 @@ mod tests {
 
     fn echo_host() -> Arc<Host> {
         let h = Host::new();
-        h.register(Arc::new(Echo { manifest: test_manifest("te", "1.0.0", vec![]), tag: "v1".into() }))
-            .unwrap();
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "1.0.0", vec![]),
+            tag: "v1".into(),
+        }))
+        .unwrap();
         h
     }
 
@@ -2026,7 +2158,10 @@ mod tests {
             c.mutation_class = Some(MutationClass::Write);
             c.required_capability = None;
         }
-        let e = Echo { manifest: m, tag: "x".into() };
+        let e = Echo {
+            manifest: m,
+            tag: "x".into(),
+        };
         assert!(h.register(Arc::new(e)).is_err());
         assert_eq!(h.list_manifests().len(), 0);
     }
@@ -2034,7 +2169,10 @@ mod tests {
     #[test]
     fn register_duplicate_version_rejected() {
         let h = echo_host();
-        let dup = Echo { manifest: test_manifest("te", "1.0.0", vec![]), tag: "dup".into() };
+        let dup = Echo {
+            manifest: test_manifest("te", "1.0.0", vec![]),
+            tag: "dup".into(),
+        };
         assert!(h.register(Arc::new(dup)).is_err());
     }
 
@@ -2043,14 +2181,19 @@ mod tests {
         let h = echo_host();
         let mut m = test_manifest("te", "1.0.0", vec![]);
         m.name = "different-name".to_string();
-        let e = Echo { manifest: m, tag: "x".into() };
+        let e = Echo {
+            manifest: m,
+            tag: "x".into(),
+        };
         assert!(h.register(Arc::new(e)).is_err());
     }
 
     #[test]
     fn call_ok_emits_receipt() {
         let h = echo_host();
-        let out = h.call(&ctx(), "te", "echo", serde_json::json!({"a": 1})).unwrap();
+        let out = h
+            .call(&ctx(), "te", "echo", serde_json::json!({"a": 1}))
+            .unwrap();
         assert_eq!(out.output["tag"], serde_json::json!("v1"));
         let rs = h.receipts();
         assert_eq!(rs.len(), 2); // registration + invocation
@@ -2067,7 +2210,9 @@ mod tests {
     #[test]
     fn call_unknown_codon_denied_and_receipted() {
         let h = echo_host();
-        let e = h.call(&ctx(), "zz", "echo", serde_json::json!({})).unwrap_err();
+        let e = h
+            .call(&ctx(), "zz", "echo", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(!e.receipt_id.is_empty());
         let r = h.receipts().last().unwrap().clone();
@@ -2079,7 +2224,9 @@ mod tests {
     #[test]
     fn call_unknown_op_denied_and_receipted() {
         let h = echo_host();
-        let e = h.call(&ctx(), "te", "nope", serde_json::json!({})).unwrap_err();
+        let e = h
+            .call(&ctx(), "te", "nope", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("unknown op"));
         assert!(!e.receipt_id.is_empty());
@@ -2088,11 +2235,20 @@ mod tests {
     #[test]
     fn call_missing_capability_denied_and_receipted() {
         let h = echo_host();
-        let e = h.call(&ctx(), "te", "sealed", serde_json::json!({})).unwrap_err();
+        let e = h
+            .call(&ctx(), "te", "sealed", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("te.write"));
         // With the capability it passes.
-        let out = h.call(&ctx_with(&["te.write"]), "te", "sealed", serde_json::json!({})).unwrap();
+        let out = h
+            .call(
+                &ctx_with(&["te.write"]),
+                "te",
+                "sealed",
+                serde_json::json!({}),
+            )
+            .unwrap();
         assert_eq!(out.output["sealed"], serde_json::json!(true));
     }
 
@@ -2108,13 +2264,27 @@ mod tests {
         // Grant confers te.write -> gated op passes.
         let g = grant_ctx_caps(&h, "ext", &["te.write"]);
         let out = h
-            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .call_with_grant(
+                &g,
+                Some("ext"),
+                Transport::Native,
+                "te",
+                "sealed",
+                serde_json::json!({}),
+            )
             .unwrap();
         assert_eq!(out.output["sealed"], serde_json::json!(true));
         // Grant without the capability -> denied by the host's authorize().
         let g2 = grant_ctx_caps(&h, "ext", &[]);
         let e = h
-            .call_with_grant(&g2, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .call_with_grant(
+                &g2,
+                Some("ext"),
+                Transport::Native,
+                "te",
+                "sealed",
+                serde_json::json!({}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("te.write"));
@@ -2130,7 +2300,14 @@ mod tests {
         chars[0] = if chars[0] == '0' { '1' } else { '0' };
         let forged = format!("{}.{}", chars.into_iter().collect::<String>(), tag);
         let e = h
-            .call_with_grant(&forged, Some("ext"), Transport::Native, "te", "echo", serde_json::json!({}))
+            .call_with_grant(
+                &forged,
+                Some("ext"),
+                Transport::Native,
+                "te",
+                "echo",
+                serde_json::json!({}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("signature"));
@@ -2145,7 +2322,14 @@ mod tests {
         let h = echo_host();
         let g = grant_ctx_caps(&h, "alice", &["te.write"]);
         let e = h
-            .call_with_grant(&g, Some("mallory"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .call_with_grant(
+                &g,
+                Some("mallory"),
+                Transport::Native,
+                "te",
+                "sealed",
+                serde_json::json!({}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("does not match grant subject"));
@@ -2156,7 +2340,14 @@ mod tests {
         let h = echo_host();
         for grant in ["", "garbage", "a.b"] {
             let e = h
-                .call_with_grant(grant, Some("ext"), Transport::Native, "te", "echo", serde_json::json!({}))
+                .call_with_grant(
+                    grant,
+                    Some("ext"),
+                    Transport::Native,
+                    "te",
+                    "echo",
+                    serde_json::json!({}),
+                )
                 .unwrap_err();
             assert_eq!(e.verdict, CallVerdict::Denied, "grant {grant:?}");
         }
@@ -2167,10 +2358,24 @@ mod tests {
         let h = echo_host();
         let g = h.issue_single_use_grant("ext", vec!["te.write".to_string()], 300);
         assert!(h
-            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .call_with_grant(
+                &g,
+                Some("ext"),
+                Transport::Native,
+                "te",
+                "sealed",
+                serde_json::json!({})
+            )
             .is_ok());
         let e = h
-            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .call_with_grant(
+                &g,
+                Some("ext"),
+                Transport::Native,
+                "te",
+                "sealed",
+                serde_json::json!({}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("replay"));
@@ -2181,7 +2386,14 @@ mod tests {
         let h = echo_host();
         let g = h.issue_grant("ext", vec!["te.write".to_string()], 0);
         let e = h
-            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .call_with_grant(
+                &g,
+                Some("ext"),
+                Transport::Native,
+                "te",
+                "sealed",
+                serde_json::json!({}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("expired"));
@@ -2191,10 +2403,15 @@ mod tests {
     fn call_bad_input_rejected_not_denied() {
         let h = Host::new();
         let mut m = test_manifest("sj", "1.0.0", vec![]);
-        m.contracts[0].input_schema =
-            serde_json::json!({"type": "object", "required": ["key"], "properties": {"key": {"type": "string"}}});
-        h.register(Arc::new(Echo { manifest: m, tag: "s".into() })).unwrap();
-        let e = h.call(&ctx(), "sj", "echo", serde_json::json!({"wrong": 1})).unwrap_err();
+        m.contracts[0].input_schema = serde_json::json!({"type": "object", "required": ["key"], "properties": {"key": {"type": "string"}}});
+        h.register(Arc::new(Echo {
+            manifest: m,
+            tag: "s".into(),
+        }))
+        .unwrap();
+        let e = h
+            .call(&ctx(), "sj", "echo", serde_json::json!({"wrong": 1}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Rejected);
         assert!(e.reason.contains("rejected"));
         let r = h.receipts().last().unwrap().clone();
@@ -2204,7 +2421,9 @@ mod tests {
     #[test]
     fn call_organelle_failure_failed_and_receipted() {
         let h = echo_host();
-        let e = h.call(&ctx(), "te", "boom", serde_json::json!({})).unwrap_err();
+        let e = h
+            .call(&ctx(), "te", "boom", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Failed);
         assert!(e.reason.contains("deliberate failure"));
         let r = h.receipts().last().unwrap().clone();
@@ -2235,7 +2454,9 @@ mod tests {
     #[test]
     fn receipt_ids_are_content_addresses() {
         let h = echo_host();
-        let _ = h.call(&ctx(), "te", "echo", serde_json::json!({"a": 1})).unwrap();
+        let _ = h
+            .call(&ctx(), "te", "echo", serde_json::json!({"a": 1}))
+            .unwrap();
         let r = h.receipts().last().unwrap().clone();
         // Recompute: same body -> same id.
         let again = r.compute_id();
@@ -2245,13 +2466,18 @@ mod tests {
     #[test]
     fn profile_gates_calls() {
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("aa", "1.0.0", vec![]), tag: "a".into() }))
-            .unwrap();
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("aa", "1.0.0", vec![]),
+            tag: "a".into(),
+        }))
+        .unwrap();
         h.create_profile("small", vec!["te".to_string()]).unwrap();
         h.activate_profile("small").unwrap();
         assert_eq!(h.active_profile().as_deref(), Some("small"));
         assert!(h.call(&ctx(), "te", "echo", serde_json::json!({})).is_ok());
-        let e = h.call(&ctx(), "aa", "echo", serde_json::json!({})).unwrap_err();
+        let e = h
+            .call(&ctx(), "aa", "echo", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("profile"));
     }
@@ -2259,8 +2485,11 @@ mod tests {
     #[test]
     fn profile_rollback_restores() {
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("aa", "1.0.0", vec![]), tag: "a".into() }))
-            .unwrap();
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("aa", "1.0.0", vec![]),
+            tag: "a".into(),
+        }))
+        .unwrap();
         h.create_profile("small", vec!["te".to_string()]).unwrap();
         h.activate_profile("small").unwrap();
         assert!(h.call(&ctx(), "aa", "echo", serde_json::json!({})).is_err());
@@ -2268,8 +2497,14 @@ mod tests {
         assert_eq!(h.active_profile(), None);
         assert!(h.call(&ctx(), "aa", "echo", serde_json::json!({})).is_ok());
         // Control-plane actions are receipted too.
-        assert!(h.receipts().iter().any(|r| r.kind == ReceiptKind::ProfileActivate));
-        assert!(h.receipts().iter().any(|r| r.kind == ReceiptKind::ProfileRollback));
+        assert!(h
+            .receipts()
+            .iter()
+            .any(|r| r.kind == ReceiptKind::ProfileActivate));
+        assert!(h
+            .receipts()
+            .iter()
+            .any(|r| r.kind == ReceiptKind::ProfileRollback));
     }
 
     #[test]
@@ -2283,8 +2518,11 @@ mod tests {
     #[test]
     fn two_versions_coexist_and_latest_wins() {
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
-            .unwrap();
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "2.0.0", vec![]),
+            tag: "v2".into(),
+        }))
+        .unwrap();
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
         assert_eq!(out.output["tag"], serde_json::json!("v2"));
     }
@@ -2292,9 +2530,13 @@ mod tests {
     #[test]
     fn route_pinned_selects_version() {
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "2.0.0", vec![]),
+            tag: "v2".into(),
+        }))
+        .unwrap();
+        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string()))
             .unwrap();
-        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string())).unwrap();
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
         assert_eq!(out.output["tag"], serde_json::json!("v1"));
     }
@@ -2302,49 +2544,70 @@ mod tests {
     #[test]
     fn route_split_is_deterministic() {
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "2.0.0", vec![]),
+            tag: "v2".into(),
+        }))
+        .unwrap();
+        h.set_route("te", RoutePolicy::Split { v2_percent: 0 })
             .unwrap();
-        h.set_route("te", RoutePolicy::Split { v2_percent: 0 }).unwrap();
         for _ in 0..5 {
             let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
             assert_eq!(out.output["tag"], serde_json::json!("v1"));
         }
-        h.set_route("te", RoutePolicy::Split { v2_percent: 100 }).unwrap();
+        h.set_route("te", RoutePolicy::Split { v2_percent: 100 })
+            .unwrap();
         for _ in 0..5 {
             let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
             assert_eq!(out.output["tag"], serde_json::json!("v2"));
         }
-        assert!(h.set_route("te", RoutePolicy::Split { v2_percent: 101 }).is_err());
+        assert!(h
+            .set_route("te", RoutePolicy::Split { v2_percent: 101 })
+            .is_err());
     }
 
     #[test]
     fn route_rollback_restores_previous() {
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "2.0.0", vec![]),
+            tag: "v2".into(),
+        }))
+        .unwrap();
+        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string()))
             .unwrap();
-        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string())).unwrap();
         let t0 = std::time::Instant::now();
         h.rollback_route("te").unwrap();
         let dt = t0.elapsed();
         assert!(dt.as_secs() < 60, "rollback must be < 60s");
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
         assert_eq!(out.output["tag"], serde_json::json!("v2")); // back to Latest
-        assert!(h.receipts().iter().any(|r| r.kind == ReceiptKind::RouteRollback));
+        assert!(h
+            .receipts()
+            .iter()
+            .any(|r| r.kind == ReceiptKind::RouteRollback));
     }
 
     #[test]
     fn set_route_errors() {
         let h = echo_host();
         assert!(h.set_route("zz", RoutePolicy::Latest).is_err());
-        assert!(h.set_route("te", RoutePolicy::Pinned("9.9.9".to_string())).is_err());
+        assert!(h
+            .set_route("te", RoutePolicy::Pinned("9.9.9".to_string()))
+            .is_err());
         assert!(h.rollback_route("te").is_err());
     }
 
     #[test]
     fn organelle_to_organelle_granted_ok() {
         let h = echo_host();
-        h.register(Arc::new(caller("ca", vec!["te.write".to_string()], "te", "sealed")))
-            .unwrap();
+        h.register(Arc::new(caller(
+            "ca",
+            vec!["te.write".to_string()],
+            "te",
+            "sealed",
+        )))
+        .unwrap();
         let out = h
             .call(&ctx_with(&[]), "ca", "relay", serde_json::json!({}))
             .unwrap();
@@ -2355,8 +2618,11 @@ mod tests {
     #[test]
     fn organelle_to_organelle_denied_and_logged() {
         let h = echo_host();
-        h.register(Arc::new(caller("cb", vec![], "te", "sealed"))).unwrap();
-        let e = h.call(&ctx(), "cb", "relay", serde_json::json!({})).unwrap_err();
+        h.register(Arc::new(caller("cb", vec![], "te", "sealed")))
+            .unwrap();
+        let e = h
+            .call(&ctx(), "cb", "relay", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Failed); // relay itself failed: boundary denial inside
         assert!(e.reason.contains("lacks granted capability"));
         let denials = h.boundary_denials();
@@ -2369,12 +2635,16 @@ mod tests {
     #[test]
     fn list_manifests_returns_routed_version() {
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
-            .unwrap();
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "2.0.0", vec![]),
+            tag: "v2".into(),
+        }))
+        .unwrap();
         let ms = h.list_manifests();
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].version, "2.0.0");
-        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string())).unwrap();
+        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string()))
+            .unwrap();
         assert_eq!(h.list_manifests()[0].version, "1.0.0");
     }
 
@@ -2385,7 +2655,8 @@ mod tests {
         let h = echo_host();
         let h2 = h.clone();
         let t = std::thread::spawn(move || {
-            h2.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap()
+            h2.call(&ctx(), "te", "echo", serde_json::json!({}))
+                .unwrap()
         });
         t.join().unwrap();
         assert!(h.verify_chain().is_ok());
@@ -2413,10 +2684,7 @@ mod tests {
         ) -> Result<Value, OrganelleError> {
             match op {
                 "inc" => {
-                    let n = self
-                        .count
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 1;
+                    let n = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     Ok(serde_json::json!({"count": n, "input": input}))
                 }
                 _ => Err(OrganelleError::not_found(format!("no such op {op}"))),
@@ -2505,7 +2773,10 @@ mod tests {
         let before = h.receipts().len();
         let e = h.kill("zz").unwrap_err();
         assert!(e.contains("unknown organelle codon"), "got: {e}");
-        assert!(e.contains("receipt"), "error must carry the receipt id: {e}");
+        assert!(
+            e.contains("receipt"),
+            "error must carry the receipt id: {e}"
+        );
         // Fail-closed: exactly one denial receipt, chain still green.
         let new = &h.receipts()[before..];
         assert_eq!(new.len(), 1);
@@ -2520,7 +2791,10 @@ mod tests {
         let before = h.receipts().len();
         let e = h.suspend("zz").unwrap_err();
         assert!(e.contains("unknown organelle codon"), "got: {e}");
-        assert!(e.contains("receipt"), "error must carry the receipt id: {e}");
+        assert!(
+            e.contains("receipt"),
+            "error must carry the receipt id: {e}"
+        );
         let new = &h.receipts()[before..];
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].kind, ReceiptKind::Suspend);
@@ -2593,15 +2867,29 @@ mod tests {
         let h = skew_host();
         h.register(Arc::new(caller("ca", vec![], "sk", "sealed")))
             .unwrap();
-        let e = h.call(&ctx(), "ca", "relay", serde_json::json!({})).unwrap_err();
+        let e = h
+            .call(&ctx(), "ca", "relay", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Failed); // relay failed: boundary denial inside
-        assert!(e.reason.contains("lacks granted capability"), "got: {}", e.reason);
+        assert!(
+            e.reason.contains("lacks granted capability"),
+            "got: {}",
+            e.reason
+        );
         // The boundary denied against the ROUTED version's policy and
         // logged it (pre-fix: no boundary denial — it passed on v2).
         let denials = h.boundary_denials();
         assert_eq!(denials.len(), 1);
-        assert!(denials[0].reason.contains("te.v1cap"), "got: {}", denials[0].reason);
-        assert!(denials[0].reason.contains("1.0.0"), "got: {}", denials[0].reason);
+        assert!(
+            denials[0].reason.contains("te.v1cap"),
+            "got: {}",
+            denials[0].reason
+        );
+        assert!(
+            denials[0].reason.contains("1.0.0"),
+            "got: {}",
+            denials[0].reason
+        );
         // The denial receipt carries the established binding: the resolved
         // version is 1.0.0 (not "-"), caller identity is bound, and the
         // membrane-internal call records no surface transport.
@@ -2625,9 +2913,16 @@ mod tests {
         // authorizes on v1's policy AND v1 executes — one version, one
         // binding, end to end.
         let h = skew_host();
-        h.register(Arc::new(caller("cb", vec!["te.v1cap".to_string()], "sk", "sealed")))
+        h.register(Arc::new(caller(
+            "cb",
+            vec!["te.v1cap".to_string()],
+            "sk",
+            "sealed",
+        )))
+        .unwrap();
+        let out = h
+            .call(&ctx(), "cb", "relay", serde_json::json!({}))
             .unwrap();
-        let out = h.call(&ctx(), "cb", "relay", serde_json::json!({})).unwrap();
         assert_eq!(out.output["sealed"], serde_json::json!(true));
         assert!(h.boundary_denials().is_empty());
         let r = h
@@ -2649,9 +2944,13 @@ mod tests {
         // Surface path: pinned route — the authorized version IS the
         // executed version, and the receipt says so.
         let h = echo_host();
-        h.register(Arc::new(Echo { manifest: test_manifest("te", "2.0.0", vec![]), tag: "v2".into() }))
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "2.0.0", vec![]),
+            tag: "v2".into(),
+        }))
+        .unwrap();
+        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string()))
             .unwrap();
-        h.set_route("te", RoutePolicy::Pinned("1.0.0".to_string())).unwrap();
         let out = h.call(&ctx(), "te", "echo", serde_json::json!({})).unwrap();
         assert_eq!(out.output["tag"], serde_json::json!("v1")); // executed v1
         let r = h.receipts().last().unwrap().clone();
@@ -2675,7 +2974,9 @@ mod tests {
             tag: "r".into(),
         }))
         .unwrap();
-        let e = h.call(&ctx(), "ro", "echo", serde_json::json!({})).unwrap_err();
+        let e = h
+            .call(&ctx(), "ro", "echo", serde_json::json!({}))
+            .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("not declared"), "got: {}", e.reason);
         assert!(e.reason.contains("native"), "got: {}", e.reason);
@@ -2697,7 +2998,14 @@ mod tests {
         .unwrap();
         let g = h.issue_grant("ext", vec![], 300);
         let out = h
-            .call_with_grant(&g, Some("ext"), Transport::Rest, "ro", "echo", serde_json::json!({"a": 1}))
+            .call_with_grant(
+                &g,
+                Some("ext"),
+                Transport::Rest,
+                "ro",
+                "echo",
+                serde_json::json!({"a": 1}),
+            )
             .unwrap();
         assert_eq!(out.output["tag"], serde_json::json!("r"));
         let r = h.receipts().last().unwrap().clone();
@@ -2720,7 +3028,14 @@ mod tests {
         .unwrap();
         let g = h.issue_grant("ext", vec![], 300);
         let e = h
-            .call_with_grant(&g, Some("ext"), Transport::Mcp, "ro", "echo", serde_json::json!({}))
+            .call_with_grant(
+                &g,
+                Some("ext"),
+                Transport::Mcp,
+                "ro",
+                "echo",
+                serde_json::json!({}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, CallVerdict::Denied);
         assert!(e.reason.contains("not declared"), "got: {}", e.reason);
@@ -2739,9 +3054,15 @@ mod tests {
         let mut m = test_manifest("nt", "1.0.0", vec![]);
         m.transports = vec![];
         let errs = h
-            .register(Arc::new(Echo { manifest: m, tag: "x".into() }))
+            .register(Arc::new(Echo {
+                manifest: m,
+                tag: "x".into(),
+            }))
             .unwrap_err();
-        assert!(errs.iter().any(|x| x.field == "transports"), "got: {errs:?}");
+        assert!(
+            errs.iter().any(|x| x.field == "transports"),
+            "got: {errs:?}"
+        );
         assert_eq!(h.list_manifests().len(), 0);
     }
 
@@ -2752,7 +3073,14 @@ mod tests {
         let h = echo_host();
         let g = h.issue_grant("ext", vec!["te.write".to_string()], 300);
         let out = h
-            .call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
+            .call_with_grant(
+                &g,
+                Some("ext"),
+                Transport::Native,
+                "te",
+                "sealed",
+                serde_json::json!({}),
+            )
             .unwrap();
         assert_eq!(out.output["sealed"], serde_json::json!(true));
         let r = h.receipts().last().unwrap().clone();
@@ -2774,8 +3102,15 @@ mod tests {
         // fields breaks the content address (verify_chain would fail).
         let h = echo_host();
         let g = h.issue_grant("ext", vec!["te.write".to_string()], 300);
-        h.call_with_grant(&g, Some("ext"), Transport::Native, "te", "sealed", serde_json::json!({}))
-            .unwrap();
+        h.call_with_grant(
+            &g,
+            Some("ext"),
+            Transport::Native,
+            "te",
+            "sealed",
+            serde_json::json!({}),
+        )
+        .unwrap();
         let stored = h.receipts().last().unwrap().clone();
         // A hostile mutation of a fetched copy is evident: the id no
         // longer recomputes over the tampered body.
@@ -2788,6 +3123,193 @@ mod tests {
         assert_eq!(again.granted_capabilities, vec!["te.write".to_string()]);
         assert_eq!(again.manifest_version, "1.0.0");
         assert_eq!(again.transport, Some(Transport::Native));
+        assert!(h.verify_chain().is_ok());
+    }
+
+    // -- GO-50 F3: typed-outcome receipt extension -------------------------
+
+    /// Organelle that records a typed outcome during handle(), the way
+    /// the typed fabric's erased adapter does.
+    struct TypedRecorder {
+        manifest: OrganelleManifest,
+    }
+
+    impl Organelle for TypedRecorder {
+        fn manifest(&self) -> OrganelleManifest {
+            self.manifest.clone()
+        }
+        fn handle(
+            &self,
+            ctx: &CallContext,
+            host: &dyn HostRef,
+            op: &str,
+            input: Value,
+        ) -> Result<Value, OrganelleError> {
+            match op {
+                "echo" => {
+                    host.record_typed_outcome(
+                        &ctx.trace_id,
+                        serde_json::json!({
+                            "truth": {"status": "proven", "basis": "test"},
+                            "provenance": {
+                                "source": "computed_locally",
+                                "input_hash": "aa",
+                                "produced_by": "tr@1.0.0",
+                                "produced_at": "2026-11-18T00:00:00.000000Z"
+                            }
+                        }),
+                    );
+                    Ok(input)
+                }
+                "boom" => Err(OrganelleError::failed("deliberate failure")),
+                _ => Err(OrganelleError::not_found(format!("no such op {op}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn typed_outcome_attached_to_receipt() {
+        let h = Host::new();
+        h.register(Arc::new(TypedRecorder {
+            manifest: test_manifest("tr", "1.0.0", vec![]),
+        }))
+        .unwrap();
+        let ctx = CallContext::new("test", vec![]);
+        let ok = h
+            .call(&ctx, "tr", "echo", serde_json::json!({"x": 1}))
+            .unwrap();
+        let receipt = h.receipt_by_id(&ok.receipt_id).unwrap();
+        let typed = receipt.typed_outcome.as_ref().expect("typed outcome");
+        assert_eq!(typed["truth"]["status"], serde_json::json!("proven"));
+        assert_eq!(
+            typed["provenance"]["produced_by"],
+            serde_json::json!("tr@1.0.0")
+        );
+        // The typed outcome is covered by the receipt id hash: tampering
+        // with it breaks the content address.
+        let mut forged = receipt.clone();
+        forged.typed_outcome = Some(serde_json::json!({"truth": {"status": "disproven"}}));
+        assert_ne!(forged.compute_id(), forged.id);
+        assert!(h.verify_chain().is_ok());
+    }
+
+    #[test]
+    fn untyped_receipts_have_no_typed_outcome() {
+        let h = echo_host();
+        let ctx = CallContext::new("test", vec![]);
+        let ok = h.call(&ctx, "te", "echo", serde_json::json!({})).unwrap();
+        let receipt = h.receipt_by_id(&ok.receipt_id).unwrap();
+        assert!(receipt.typed_outcome.is_none());
+        // Old-shape receipts (no typed_outcome key at all) still
+        // deserialize and still verify: the field defaults to None.
+        let old_json = serde_json::json!({
+            "id": receipt.id, "ts": receipt.ts, "seq": receipt.seq,
+            "kind": "invocation", "codon": "te", "op": "echo",
+            "manifest_version": "1.0.0", "caller": "test",
+            "granted_capabilities": [], "transport": "native",
+            "input_hash": receipt.input_hash,
+            "output_hash": receipt.output_hash, "verdict": "ok",
+            "valence": "candidate", "prev": receipt.prev, "note": null
+        });
+        let old: Receipt = serde_json::from_value(old_json).unwrap();
+        assert!(old.typed_outcome.is_none());
+        assert_eq!(old.compute_id(), old.id);
+    }
+
+    #[test]
+    fn failed_invocation_carries_no_typed_outcome() {
+        let h = Host::new();
+        h.register(Arc::new(TypedRecorder {
+            manifest: test_manifest("tr", "1.0.0", vec![]),
+        }))
+        .unwrap();
+        let ctx = CallContext::new("test", vec![]);
+        let err = h
+            .call(&ctx, "tr", "boom", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(err.verdict, CallVerdict::Failed);
+        let receipt = h.receipt_by_id(&err.receipt_id).unwrap();
+        assert!(receipt.typed_outcome.is_none());
+        assert!(h.verify_chain().is_ok());
+    }
+
+    // -- F6: hostile review ----------------------------------------------
+
+    /// Organelle that records a typed outcome and then panics — the
+    /// F3-G6 stash-leak vector: the stash entry is removed only after
+    /// handle() returns, so a panic leaves it behind for a later
+    /// call to pick up.
+    struct PanicRecorder {
+        manifest: OrganelleManifest,
+    }
+
+    impl Organelle for PanicRecorder {
+        fn manifest(&self) -> OrganelleManifest {
+            self.manifest.clone()
+        }
+        fn handle(
+            &self,
+            ctx: &CallContext,
+            host: &dyn HostRef,
+            _op: &str,
+            _input: Value,
+        ) -> Result<Value, OrganelleError> {
+            host.record_typed_outcome(
+                &ctx.trace_id,
+                serde_json::json!({
+                    "truth": {"status": "proven", "basis": "test"},
+                    "provenance": {
+                        "source": "computed_locally",
+                        "input_hash": "aa",
+                        "produced_by": "pr@1.0.0",
+                        "produced_at": "2026-11-18T00:00:00.000000Z"
+                    }
+                }),
+            );
+            panic!("f6: handler panics after recording a typed outcome");
+        }
+    }
+
+    /// F6-H4: a handler that records a typed outcome and then panics
+    /// must not leak the stash entry. Trace ids are caller-controlled
+    /// on the native path (the dispatcher honors envelope.trace_id),
+    /// so a later call reusing the same trace id would pick up the
+    /// stale outcome — cross-attributing one invocation's truth and
+    /// provenance to another invocation's receipt.
+    #[test]
+    fn f6_panic_after_record_does_not_leak_stash_entry() {
+        let h = Host::new();
+        h.register(Arc::new(PanicRecorder {
+            manifest: test_manifest("pr", "1.0.0", vec![]),
+        }))
+        .unwrap();
+        h.register(Arc::new(Echo {
+            manifest: test_manifest("te", "1.0.0", vec![]),
+            tag: "v1".into(),
+        }))
+        .unwrap();
+        let trace = "f6-reused-trace-id".to_string();
+        let mut ctx1 = CallContext::new("test", vec![]);
+        ctx1.trace_id = trace.clone();
+        // The panic still propagates (host behavior preserved); the
+        // test only catches it to keep running.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.call(&ctx1, "pr", "echo", serde_json::json!({}))
+        }));
+        assert!(r.is_err(), "the handler panic must propagate");
+        // Same trace id, untyped call: its receipt must carry NO
+        // typed outcome (the stale entry must be gone).
+        let mut ctx2 = CallContext::new("test", vec![]);
+        ctx2.trace_id = trace;
+        let ok = h
+            .call(&ctx2, "te", "echo", serde_json::json!({"x": 1}))
+            .unwrap();
+        let receipt = h.receipt_by_id(&ok.receipt_id).unwrap();
+        assert!(
+            receipt.typed_outcome.is_none(),
+            "stale typed outcome leaked across a reused trace id: {:?}",
+            receipt.typed_outcome
+        );
         assert!(h.verify_chain().is_ok());
     }
 }

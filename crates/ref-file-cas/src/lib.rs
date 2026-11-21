@@ -68,7 +68,10 @@ pub fn organelle() -> Arc<dyn Organelle> {
 }
 
 pub fn organelle_with_dir(dir: String) -> Arc<dyn Organelle> {
-    Arc::new(FileCas { manifest: manifest(), dir })
+    Arc::new(FileCas {
+        manifest: manifest(),
+        dir,
+    })
 }
 
 pub fn default_dir() -> String {
@@ -117,7 +120,9 @@ impl Organelle for FileCas {
                 }
                 let path = format!("{}/{id}", self.dir);
                 match std::fs::read_to_string(&path) {
-                    Ok(content) => Ok(serde_json::json!({"found": true, "id": id, "content": content})),
+                    Ok(content) => {
+                        Ok(serde_json::json!({"found": true, "id": id, "content": content}))
+                    }
                     Err(_) => Ok(serde_json::json!({"found": false, "id": id})),
                 }
             }
@@ -152,19 +157,43 @@ mod tests {
         let h = rooted_host();
         h.register(organelle_with_dir(dir.clone())).unwrap();
         let ctx = CallContext::new("test", vec!["cas.write".to_string()]);
-        let put = h.call(&ctx, "fc", "put", serde_json::json!({"content": "hello cas"})).unwrap().output;
+        let put = h
+            .call(
+                &ctx,
+                "fc",
+                "put",
+                serde_json::json!({"content": "hello cas"}),
+            )
+            .unwrap()
+            .output;
         let id = put["id"].as_str().unwrap().to_string();
         assert_eq!(id.len(), 64);
         // Same content -> same id (content addressing).
-        let put2 = h.call(&ctx, "fc", "put", serde_json::json!({"content": "hello cas"})).unwrap().output;
+        let put2 = h
+            .call(
+                &ctx,
+                "fc",
+                "put",
+                serde_json::json!({"content": "hello cas"}),
+            )
+            .unwrap()
+            .output;
         assert_eq!(put2["id"], serde_json::json!(id));
         // get works without the write capability.
         let reader = CallContext::new("reader", vec![]);
-        let got = h.call(&reader, "fc", "get", serde_json::json!({"id": id})).unwrap().output;
+        let got = h
+            .call(&reader, "fc", "get", serde_json::json!({"id": id}))
+            .unwrap()
+            .output;
         assert_eq!(got["found"], serde_json::json!(true));
         assert_eq!(got["content"], serde_json::json!("hello cas"));
         let missing = h
-            .call(&reader, "fc", "get", serde_json::json!({"id": "0".repeat(64)}))
+            .call(
+                &reader,
+                "fc",
+                "get",
+                serde_json::json!({"id": "0".repeat(64)}),
+            )
             .unwrap()
             .output;
         assert_eq!(missing["found"], serde_json::json!(false));
@@ -199,11 +228,15 @@ mod tests {
         let h = rooted_host();
         h.register(organelle_with_dir(dir)).unwrap();
         let ctx = CallContext::new("test", vec![]);
-        let e = h.call(&ctx, "fc", "get", serde_json::json!({"id": "../evil"})).unwrap_err();
+        let e = h
+            .call(&ctx, "fc", "get", serde_json::json!({"id": "../evil"}))
+            .unwrap_err();
         // schema rejects (length) before handle; either way it must not read.
         assert!(matches!(
             e.verdict,
-            organelle_host::CallVerdict::Rejected | organelle_host::CallVerdict::Failed | organelle_host::CallVerdict::Denied
+            organelle_host::CallVerdict::Rejected
+                | organelle_host::CallVerdict::Failed
+                | organelle_host::CallVerdict::Denied
         ));
     }
 

@@ -2,7 +2,10 @@
 members = [
     "crates/organelle-manifest",
     "crates/organelle-host",
+    "crates/organelle-typed",
     "crates/ref-common",
+    "crates/ref-typed-hash",
+    "crates/ref-typed-commit",
     "crates/ref-kv-store",
     "crates/ref-http-fetch",
     "crates/ref-text-transform",
@@ -30,4 +33,5 @@ sha2 = "0.10"
 hex = "0.4"
 organelle-manifest = { path = "crates/organelle-manifest" }
 organelle-host = { path = "crates/organelle-host" }
+organelle-typed = { path = "crates/organelle-typed" }
 ref-common = { path = "crates/ref-common" }

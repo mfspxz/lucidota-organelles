@@ -170,7 +170,9 @@ fn r5_bypass_open_store_on_victims_book() {
     assert_ne!(tok_o, tok_m, "distinct tokens");
     assert_eq!(
         out_m["store_path"].as_str().unwrap(),
-        open_store(&h, &og, "operator", &b)["store_path"].as_str().unwrap(),
+        open_store(&h, &og, "operator", &b)["store_path"]
+            .as_str()
+            .unwrap(),
         "same canonical book"
     );
 

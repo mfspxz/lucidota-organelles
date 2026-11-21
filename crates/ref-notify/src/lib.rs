@@ -60,7 +60,10 @@ pub fn organelle() -> Arc<dyn Organelle> {
 
 /// Outbox override (tests / harness point all transports at one dir).
 pub fn organelle_with_outbox(outbox: String) -> Arc<dyn Organelle> {
-    Arc::new(Notify { manifest: manifest(), outbox })
+    Arc::new(Notify {
+        manifest: manifest(),
+        outbox,
+    })
 }
 
 pub fn default_outbox() -> String {
@@ -137,8 +140,12 @@ mod tests {
         h.register(organelle_with_outbox(outbox.clone())).unwrap();
         let ctx = CallContext::new("test", vec!["notify.send".to_string()]);
         let out = h
-            .call(&ctx, "nt", "send",
-                serde_json::json!({"channel": "test", "title": "T", "body": "B"}))
+            .call(
+                &ctx,
+                "nt",
+                "send",
+                serde_json::json!({"channel": "test", "title": "T", "body": "B"}),
+            )
             .unwrap()
             .output;
         assert_eq!(out["queued"], serde_json::json!(true));
@@ -158,11 +165,16 @@ mod tests {
         let h = Host::new();
         h.set_write_roots(vec![root.clone()]).unwrap();
         let evil_outbox = tmp_outbox("outside");
-        h.register(organelle_with_outbox(evil_outbox.clone())).unwrap();
+        h.register(organelle_with_outbox(evil_outbox.clone()))
+            .unwrap();
         let ctx = CallContext::new("test", vec!["notify.send".to_string()]);
         let e = h
-            .call(&ctx, "nt", "send",
-                serde_json::json!({"channel": "c", "title": "t", "body": "b"}))
+            .call(
+                &ctx,
+                "nt",
+                "send",
+                serde_json::json!({"channel": "c", "title": "t", "body": "b"}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
         assert!(e.reason.contains("denied"), "{}", e.reason);
@@ -173,11 +185,16 @@ mod tests {
     #[test]
     fn without_capability_denied() {
         let h = rooted_host();
-        h.register(organelle_with_outbox(tmp_outbox("denied"))).unwrap();
+        h.register(organelle_with_outbox(tmp_outbox("denied")))
+            .unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h
-            .call(&ctx, "nt", "send",
-                serde_json::json!({"channel": "c", "title": "t", "body": "b"}))
+            .call(
+                &ctx,
+                "nt",
+                "send",
+                serde_json::json!({"channel": "c", "title": "t", "body": "b"}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Denied);
     }

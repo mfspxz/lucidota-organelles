@@ -3,8 +3,16 @@
 //! A second membrane around the same host: JSON-lines over a unix socket.
 //! The contract tests are transport-agnostic, so this surface runs the
 //! identical scenarios as native/REST/MCP (see organelle-equivalence).
+//!
+//! GO-50 Phase 1, family F4 — typed projection: `spawn_server_typed`
+//! serves the same wire protocol from the universal dispatcher instead
+//! of the host directly. Single source:
+//! [`organelle_typed::TypedDispatcher::typed_manifests`]. Calls route
+//! through the dispatcher's staged pipeline and the response carries
+//! truth + provenance (optional fields, absent for untyped calls).
 
 use organelle_host::Host;
+use organelle_typed::{InvocationEnvelope, TypedDispatcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -35,6 +43,10 @@ pub struct WireRequest {
 }
 
 /// One result. `receipt` is always populated — even for refusals.
+/// `truth` / `provenance` are present only for typed calls (F4):
+/// the dispatcher's typed outcome, as separate fields. Both default
+/// to `None` on deserialization, so old wire responses (and untyped
+/// calls) parse unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireResponse {
     pub id: u64,
@@ -42,6 +54,10 @@ pub struct WireResponse {
     pub output: Option<Value>,
     pub error: Option<WireError>,
     pub receipt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,17 +91,34 @@ fn handle_conn(host: Arc<Host>, stream: UnixStream) {
                     reason: format!("malformed request: {e}"),
                 }),
                 receipt: String::new(),
+                truth: None,
+                provenance: None,
             },
             Ok(req) => {
                 // Authority comes ONLY from the grant. The claimed caller
                 // identity is bound to the grant's subject inside
                 // `call_with_grant`; a missing/invalid grant is denied.
-                match host.call_with_grant(&req.grant, Some(&req.caller), organelle_manifest::Transport::UnixSocket, &req.codon, &req.op, req.input) {
+                match host.call_with_grant(
+                    &req.grant,
+                    Some(&req.caller),
+                    organelle_manifest::Transport::UnixSocket,
+                    &req.codon,
+                    &req.op,
+                    req.input,
+                ) {
                     // P1: the receipt id comes from the invocation result —
                     // the exact receipt this invocation emitted — never from
                     // a global "latest receipt" read (which cross-wires under
                     // concurrency).
-                    Ok(ok) => WireResponse { id: req.id, ok: true, output: Some(ok.output), error: None, receipt: ok.receipt_id },
+                    Ok(ok) => WireResponse {
+                        id: req.id,
+                        ok: true,
+                        output: Some(ok.output),
+                        error: None,
+                        receipt: ok.receipt_id,
+                        truth: None,
+                        provenance: None,
+                    },
                     Err(e) => WireResponse {
                         id: req.id,
                         ok: false,
@@ -95,6 +128,86 @@ fn handle_conn(host: Arc<Host>, stream: UnixStream) {
                             reason: e.reason,
                         }),
                         receipt: e.receipt_id,
+                        truth: None,
+                        provenance: None,
+                    },
+                }
+            }
+        };
+        let mut out = serde_json::to_string(&resp).unwrap();
+        out.push('\n');
+        if writer.write_all(out.as_bytes()).is_err() {
+            break;
+        }
+    }
+}
+
+/// Handle one connection on the typed server: the same wire protocol,
+/// but every call routes through the dispatcher's staged pipeline
+/// (ontology re-resolution, oracle/govern stages, truth + provenance)
+/// instead of the host directly. The grant is always passed through
+/// (even empty, so a missing grant is denied by the host's grant
+/// verification, never default-allowed onto the native path).
+fn handle_conn_typed(dispatcher: Arc<TypedDispatcher>, stream: UnixStream) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = stream;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let resp = match serde_json::from_str::<WireRequest>(trimmed) {
+            Err(e) => WireResponse {
+                id: 0,
+                ok: false,
+                output: None,
+                error: Some(WireError {
+                    verdict: "rejected".to_string(),
+                    reason: format!("malformed request: {e}"),
+                }),
+                receipt: String::new(),
+                truth: None,
+                provenance: None,
+            },
+            Ok(req) => {
+                let envelope = InvocationEnvelope {
+                    caller: req.caller,
+                    codon: req.codon,
+                    op: req.op,
+                    input: req.input,
+                    trace_id: None,
+                    capabilities: Vec::new(),
+                    transport: organelle_manifest::Transport::UnixSocket,
+                    grant: Some(req.grant),
+                };
+                match dispatcher.dispatch(envelope) {
+                    Ok(ok) => WireResponse {
+                        id: req.id,
+                        ok: true,
+                        output: Some(ok.output),
+                        error: None,
+                        receipt: ok.receipt_id,
+                        truth: Some(serde_json::to_value(&ok.truth).unwrap()),
+                        provenance: Some(serde_json::to_value(&ok.provenance).unwrap()),
+                    },
+                    Err(e) => WireResponse {
+                        id: req.id,
+                        ok: false,
+                        output: None,
+                        error: Some(WireError {
+                            verdict: e.verdict().to_string(),
+                            reason: e.to_string(),
+                        }),
+                        receipt: e.receipt_id(),
+                        truth: None,
+                        provenance: None,
                     },
                 }
             }
@@ -152,7 +265,45 @@ pub fn spawn_server(host: Arc<Host>, path: &Path) -> std::io::Result<UnixServerH
             Err(_) => break,
         }
     });
-    Ok(UnixServerHandle { path: path_buf, shutdown: tx, thread: Some(thread) })
+    Ok(UnixServerHandle {
+        path: path_buf,
+        shutdown: tx,
+        thread: Some(thread),
+    })
+}
+
+/// Spawn the typed unix-socket surface on `path` (stale socket file
+/// removed). Same wire protocol as [`spawn_server`]; calls route
+/// through the dispatcher and responses carry truth + provenance.
+pub fn spawn_server_typed(
+    dispatcher: Arc<TypedDispatcher>,
+    path: &Path,
+) -> std::io::Result<UnixServerHandle> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    let (tx, rx) = mpsc::channel::<()>();
+    let path_buf = path.to_path_buf();
+    let thread = thread::spawn(move || loop {
+        if rx.try_recv().is_ok() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let d = dispatcher.clone();
+                thread::spawn(move || handle_conn_typed(d, stream));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    });
+    Ok(UnixServerHandle {
+        path: path_buf,
+        shutdown: tx,
+        thread: Some(thread),
+    })
 }
 
 pub struct UnixClient;
@@ -180,7 +331,10 @@ mod tests {
 
     fn tmp_sock(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("organelle-unix-test-{tag}-{}.sock", std::process::id()));
+        p.push(format!(
+            "organelle-unix-test-{tag}-{}.sock",
+            std::process::id()
+        ));
         p
     }
 
@@ -191,15 +345,19 @@ mod tests {
         h
     }
 
-    fn req(id: u64, h: &Host, caller: &str, caps: &[&str], codon: &str, op: &str, input: Value) -> WireRequest {
+    fn req(
+        id: u64,
+        h: &Host,
+        caller: &str,
+        caps: &[&str],
+        codon: &str,
+        op: &str,
+        input: Value,
+    ) -> WireRequest {
         WireRequest {
             id,
             caller: caller.into(),
-            grant: h.issue_grant(
-                caller,
-                caps.iter().map(|s| s.to_string()).collect(),
-                300,
-            ),
+            grant: h.issue_grant(caller, caps.iter().map(|s| s.to_string()).collect(), 300),
             codon: codon.into(),
             op: op.into(),
             input,
@@ -213,8 +371,15 @@ mod tests {
         let srv = spawn_server(h.clone(), &path).unwrap();
         let resp = UnixClient::call(
             &path,
-            &req(1, &h, "test", &[], "tt", "transform",
-                serde_json::json!({"text": "hi", "mode": "upper"})),
+            &req(
+                1,
+                &h,
+                "test",
+                &[],
+                "tt",
+                "transform",
+                serde_json::json!({"text": "hi", "mode": "upper"}),
+            ),
         )
         .unwrap();
         assert!(resp.ok);
@@ -232,8 +397,15 @@ mod tests {
         // Valid grant, but no kv.write -> the host denies on authority.
         let resp = UnixClient::call(
             &path,
-            &req(2, &h, "test", &[], "kv", "put",
-                serde_json::json!({"key": "a", "value": 1})),
+            &req(
+                2,
+                &h,
+                "test",
+                &[],
+                "kv",
+                "put",
+                serde_json::json!({"key": "a", "value": 1}),
+            ),
         )
         .unwrap();
         assert!(!resp.ok);
@@ -249,8 +421,15 @@ mod tests {
         let srv = spawn_server(h.clone(), &path).unwrap();
         let resp = UnixClient::call(
             &path,
-            &req(3, &h, "test", &["kv.write"], "kv", "put",
-                serde_json::json!({"key": "a", "value": 1})),
+            &req(
+                3,
+                &h,
+                "test",
+                &["kv.write"],
+                "kv",
+                "put",
+                serde_json::json!({"key": "a", "value": 1}),
+            ),
         )
         .unwrap();
         assert!(resp.ok, "{resp:?}");
@@ -280,12 +459,12 @@ mod tests {
         let srv = spawn_server(h.clone(), &path).unwrap();
         let input = serde_json::json!({"text": "Parity", "mode": "slug"});
         let ctx = CallContext::new("test", vec![]);
-        let native = h.call(&ctx, "tt", "transform", input.clone()).unwrap().output;
-        let via_socket = UnixClient::call(
-            &path,
-            &req(9, &h, "test", &[], "tt", "transform", input),
-        )
-        .unwrap();
+        let native = h
+            .call(&ctx, "tt", "transform", input.clone())
+            .unwrap()
+            .output;
+        let via_socket =
+            UnixClient::call(&path, &req(9, &h, "test", &[], "tt", "transform", input)).unwrap();
         assert_eq!(
             organelle_manifest::canonical_json(&native),
             organelle_manifest::canonical_json(&via_socket.output.unwrap())
@@ -321,11 +500,22 @@ mod tests {
                     });
                     let resp = UnixClient::call(
                         &path,
-                        &req((t * 1000 + i) as u64, &h, &caller, &[], "tt", "transform", input.clone()),
+                        &req(
+                            (t * 1000 + i) as u64,
+                            &h,
+                            &caller,
+                            &[],
+                            "tt",
+                            "transform",
+                            input.clone(),
+                        ),
                     )
                     .unwrap();
                     assert!(resp.ok, "{resp:?}");
-                    assert_eq!(resp.output.unwrap()["result"], serde_json::json!(format!("THREAD-{t}-CALL-{i}")));
+                    assert_eq!(
+                        resp.output.unwrap()["result"],
+                        serde_json::json!(format!("THREAD-{t}-CALL-{i}"))
+                    );
                     out.push((caller.clone(), input, resp.receipt));
                 }
                 out
@@ -340,17 +530,26 @@ mod tests {
         // Every wire receipt id is unique and resolves to the stored
         // receipt for exactly that invocation.
         let mut seen = std::collections::HashSet::new();
-        let store: std::collections::HashMap<String, organelle_host::Receipt> =
-            h.receipts().into_iter().map(|r| (r.id.clone(), r)).collect();
+        let store: std::collections::HashMap<String, organelle_host::Receipt> = h
+            .receipts()
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
         assert_eq!(store.len() - baseline, THREADS * PER_THREAD);
         for (caller, input, rid) in &records {
             assert!(!rid.is_empty());
             assert!(seen.insert(rid.clone()), "duplicate receipt id {rid}");
-            let r = store.get(rid).unwrap_or_else(|| panic!("receipt {rid} missing from store"));
+            let r = store
+                .get(rid)
+                .unwrap_or_else(|| panic!("receipt {rid} missing from store"));
             assert_eq!(r.caller, *caller, "receipt {rid} caller");
             assert_eq!(r.codon, "tt", "receipt {rid} codon");
             assert_eq!(r.op, "transform", "receipt {rid} op");
-            assert_eq!(r.input_hash, organelle_manifest::hash_value(input), "receipt {rid} input_hash");
+            assert_eq!(
+                r.input_hash,
+                organelle_manifest::hash_value(input),
+                "receipt {rid} input_hash"
+            );
         }
         assert!(h.verify_chain().is_ok());
         srv.shutdown();
@@ -361,7 +560,9 @@ mod tests {
 
     fn raw_line(path: &Path, line: &str) -> WireResponse {
         let mut stream = UnixStream::connect(path).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         stream.write_all(line.as_bytes()).unwrap();
         stream.write_all(b"\n").unwrap();
         let mut reader = BufReader::new(stream);
@@ -386,8 +587,11 @@ mod tests {
         let resp = UnixClient::call(
             &path,
             &WireRequest {
-                id: 1, caller: "test".into(), grant: forged,
-                codon: "kv".into(), op: "put".into(),
+                id: 1,
+                caller: "test".into(),
+                grant: forged,
+                codon: "kv".into(),
+                op: "put".into(),
                 input: serde_json::json!({"key": "a", "value": 1}),
             },
         )
@@ -407,8 +611,15 @@ mod tests {
         // Grant confers only kv.read; kv.put requires kv.write.
         let resp = UnixClient::call(
             &path,
-            &req(1, &h, "test", &["kv.read"], "kv", "put",
-                serde_json::json!({"key": "a", "value": 1})),
+            &req(
+                1,
+                &h,
+                "test",
+                &["kv.read"],
+                "kv",
+                "put",
+                serde_json::json!({"key": "a", "value": 1}),
+            ),
         )
         .unwrap();
         assert!(!resp.ok);
@@ -445,8 +656,11 @@ mod tests {
         let srv = spawn_server(h.clone(), &path).unwrap();
         let grant = h.issue_single_use_grant("test", vec!["kv.write".to_string()], 300);
         let mk = |id| WireRequest {
-            id, caller: "test".into(), grant: grant.clone(),
-            codon: "kv".into(), op: "put".into(),
+            id,
+            caller: "test".into(),
+            grant: grant.clone(),
+            codon: "kv".into(),
+            op: "put".into(),
             input: serde_json::json!({"key": "a", "value": 1}),
         };
         let first = UnixClient::call(&path, &mk(1)).unwrap();
@@ -468,15 +682,22 @@ mod tests {
         let resp = UnixClient::call(
             &path,
             &WireRequest {
-                id: 1, caller: "mallory".into(), grant,
-                codon: "kv".into(), op: "put".into(),
+                id: 1,
+                caller: "mallory".into(),
+                grant,
+                codon: "kv".into(),
+                op: "put".into(),
                 input: serde_json::json!({"key": "a", "value": 1}),
             },
         )
         .unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.as_ref().unwrap().verdict, "Denied");
-        assert!(resp.error.unwrap().reason.contains("does not match grant subject"));
+        assert!(resp
+            .error
+            .unwrap()
+            .reason
+            .contains("does not match grant subject"));
         srv.shutdown();
     }
 
@@ -488,14 +709,124 @@ mod tests {
         let resp = UnixClient::call(
             &path,
             &WireRequest {
-                id: 1, caller: "test".into(), grant: String::new(),
-                codon: "tt".into(), op: "transform".into(),
+                id: 1,
+                caller: "test".into(),
+                grant: String::new(),
+                codon: "tt".into(),
+                op: "transform".into(),
                 input: serde_json::json!({"text": "hi", "mode": "upper"}),
             },
         )
         .unwrap();
         assert!(!resp.ok, "no auth material must never default-allow");
         assert_eq!(resp.error.as_ref().unwrap().verdict, "Denied");
+        srv.shutdown();
+    }
+
+    // -- F4: typed projection (single source: typed_manifests()) --------
+
+    fn typed_dispatcher() -> Arc<TypedDispatcher> {
+        let h = Host::new();
+        let d = TypedDispatcher::new(h, organelle_typed::LockRegistry::with_go50());
+        d.register_typed(ref_typed_hash::TypedHash::new())
+            .expect("typed-hash must register");
+        Arc::new(d)
+    }
+
+    #[test]
+    fn typed_roundtrip_with_truth_and_provenance() {
+        let d = typed_dispatcher();
+        let path = tmp_sock("typed-ok");
+        let srv = spawn_server_typed(d.clone(), &path).unwrap();
+        let grant = d.host().issue_grant("test", vec![], 300);
+        let resp = UnixClient::call(
+            &path,
+            &WireRequest {
+                id: 1,
+                caller: "test".into(),
+                grant,
+                codon: "th".into(),
+                op: "sha256".into(),
+                input: serde_json::json!({"text": "abc"}),
+            },
+        )
+        .unwrap();
+        assert!(resp.ok, "{resp:?}");
+        assert_eq!(
+            resp.output.as_ref().unwrap()["hex"],
+            serde_json::json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            resp.truth.as_ref().unwrap()["status"],
+            serde_json::json!("proven")
+        );
+        assert_eq!(
+            resp.provenance.as_ref().unwrap()["produced_by"],
+            serde_json::json!("th@1.0.0")
+        );
+        assert!(!resp.receipt.is_empty());
+        let r = d
+            .host()
+            .receipt_by_id(&resp.receipt)
+            .expect("receipt resolves");
+        assert_eq!(r.codon, "th");
+        assert_eq!(r.op, "sha256");
+        srv.shutdown();
+    }
+
+    #[test]
+    fn typed_denial_crosses_socket_with_receipt() {
+        let d = typed_dispatcher();
+        let path = tmp_sock("typed-denied");
+        let srv = spawn_server_typed(d.clone(), &path).unwrap();
+        // No grant -> the host's grant verification denies.
+        let resp = UnixClient::call(
+            &path,
+            &WireRequest {
+                id: 1,
+                caller: "test".into(),
+                grant: String::new(),
+                codon: "th".into(),
+                op: "sha256".into(),
+                input: serde_json::json!({"text": "abc"}),
+            },
+        )
+        .unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.error.as_ref().unwrap().verdict, "Denied");
+        assert!(!resp.receipt.is_empty());
+        srv.shutdown();
+    }
+
+    #[test]
+    fn untyped_response_has_no_typed_fields() {
+        // Backward compatibility: untyped calls serialize no truth /
+        // provenance, and old wire JSON (without the fields) still
+        // deserializes.
+        let h = host();
+        let path = tmp_sock("untyped-fields");
+        let srv = spawn_server(h.clone(), &path).unwrap();
+        let resp = UnixClient::call(
+            &path,
+            &req(
+                1,
+                &h,
+                "test",
+                &[],
+                "tt",
+                "transform",
+                serde_json::json!({"text": "hi", "mode": "upper"}),
+            ),
+        )
+        .unwrap();
+        assert!(resp.ok);
+        assert!(resp.truth.is_none());
+        assert!(resp.provenance.is_none());
+        let old_wire =
+            r#"{"id":1,"ok":true,"output":{"result":"HI"},"error":null,"receipt":"abc"}"#;
+        let parsed: WireResponse = serde_json::from_str(old_wire).unwrap();
+        assert!(parsed.truth.is_none());
+        assert!(parsed.provenance.is_none());
         srv.shutdown();
     }
 }

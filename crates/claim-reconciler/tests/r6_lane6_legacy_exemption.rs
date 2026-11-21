@@ -84,10 +84,7 @@ fn rcall(h: &Arc<Host>, sg: &str, op: &str, input: Value) -> Value {
 /// (sha256(prev_hash + seq + canonical(entry))). Returns the forged seq.
 fn forge_supersede_no_artifact(book_path: &str, claim_id: &str, claim_seq: u64) -> u64 {
     let text = std::fs::read_to_string(book_path).unwrap();
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let seq = lines.len() as u64;
     let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
     let prev = last["entry_hash"].as_str().unwrap().to_string();

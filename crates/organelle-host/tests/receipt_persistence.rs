@@ -115,9 +115,14 @@ fn persistence_survives_restart() {
     {
         let (h, log) = persistent_host(&dir);
         log_s = log;
-        h.register(Arc::new(Echo { manifest: manifest("pe") })).unwrap();
+        h.register(Arc::new(Echo {
+            manifest: manifest("pe"),
+        }))
+        .unwrap();
         for i in 0..10 {
-            let ok = h.call(&ctx(), "pe", "echo", serde_json::json!({"i": i})).unwrap();
+            let ok = h
+                .call(&ctx(), "pe", "echo", serde_json::json!({"i": i}))
+                .unwrap();
             ids.push(ok.receipt_id);
         }
         assert_eq!(h.receipts().len(), 11); // registration + 10
@@ -142,9 +147,14 @@ fn persistence_survives_restart() {
         // Recovery restores receipts, not the organelle registry: the
         // operator re-registers organelles on restart (itself receipted),
         // and the chain continues linked to the reloaded head.
-        h.register(Arc::new(Echo { manifest: manifest("pe") })).unwrap();
+        h.register(Arc::new(Echo {
+            manifest: manifest("pe"),
+        }))
+        .unwrap();
         let head_before = h.receipts().last().unwrap().id.clone();
-        let ok = h.call(&ctx(), "pe", "echo", serde_json::json!({"i": 99})).unwrap();
+        let ok = h
+            .call(&ctx(), "pe", "echo", serde_json::json!({"i": 99}))
+            .unwrap();
         let r = h.receipts().last().unwrap().clone();
         assert_eq!(r.seq, 13); // 11 reloaded + registration + this call
         assert_eq!(r.prev, head_before);
@@ -161,7 +171,10 @@ fn returned_id_is_durable_before_return() {
     // through the host.
     let dir = tmpdir("durable");
     let (h, log) = persistent_host(&dir);
-    h.register(Arc::new(Echo { manifest: manifest("pd") })).unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("pd"),
+    }))
+    .unwrap();
     let ok = h
         .call(&ctx(), "pd", "echo", serde_json::json!({"k": "v"}))
         .unwrap();
@@ -184,7 +197,10 @@ fn concurrent_writes_no_loss_no_dupes() {
     {
         let (h, log) = persistent_host(&dir);
         log_s = log;
-        h.register(Arc::new(Echo { manifest: manifest("pc") })).unwrap();
+        h.register(Arc::new(Echo {
+            manifest: manifest("pc"),
+        }))
+        .unwrap();
         let mut handles = Vec::new();
         for t in 0..THREADS {
             let h2 = h.clone();
@@ -236,9 +252,13 @@ fn torn_tail_truncated_on_recovery() {
     {
         let (h, log) = persistent_host(&dir);
         log_s = log.clone();
-        h.register(Arc::new(Echo { manifest: manifest("pt") })).unwrap();
+        h.register(Arc::new(Echo {
+            manifest: manifest("pt"),
+        }))
+        .unwrap();
         for i in 0..3 {
-            h.call(&ctx(), "pt", "echo", serde_json::json!({"i": i})).unwrap();
+            h.call(&ctx(), "pt", "echo", serde_json::json!({"i": i}))
+                .unwrap();
         }
         assert_eq!(h.receipts().len(), 4);
     }
@@ -255,7 +275,10 @@ fn torn_tail_truncated_on_recovery() {
         bounds.push(off as u64);
     }
     assert_eq!(off as u64, len, "file holds exactly 4 records");
-    let f = std::fs::OpenOptions::new().write(true).open(&log_s).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log_s)
+        .unwrap();
     f.set_len(len - 7).unwrap();
     drop(f);
     {
@@ -263,7 +286,10 @@ fn torn_tail_truncated_on_recovery() {
         h.set_write_roots(vec![dir.clone()]).unwrap();
         let outcome = h.enable_receipt_log(log_s.to_str().unwrap()).unwrap();
         match outcome {
-            RecoveryOutcome::Repaired { count, dropped_tail_bytes } => {
+            RecoveryOutcome::Repaired {
+                count,
+                dropped_tail_bytes,
+            } => {
                 assert_eq!(count, 3);
                 // The torn partial record ran from bounds[3] to len-7.
                 assert_eq!(dropped_tail_bytes, (len - 7) - bounds[3]);
@@ -276,9 +302,14 @@ fn torn_tail_truncated_on_recovery() {
         assert_eq!(std::fs::metadata(&log_s).unwrap().len(), bounds[3]);
         // Chain continues cleanly from the repaired head (re-register the
         // organelle first: recovery restores receipts, not the registry).
-        h.register(Arc::new(Echo { manifest: manifest("pt") })).unwrap();
+        h.register(Arc::new(Echo {
+            manifest: manifest("pt"),
+        }))
+        .unwrap();
         let head_before = h.receipts().last().unwrap().id.clone();
-        let ok = h.call(&ctx(), "pt", "echo", serde_json::json!({"i": 9})).unwrap();
+        let ok = h
+            .call(&ctx(), "pt", "echo", serde_json::json!({"i": 9}))
+            .unwrap();
         let r = h.receipts().last().unwrap().clone();
         assert_eq!(r.seq, 5); // 3 repaired + registration + this call
         assert_eq!(r.prev, head_before);
@@ -297,9 +328,14 @@ fn corrupt_record_fails_closed() {
     {
         let (h, log) = persistent_host(&dir);
         log_s = log.clone();
-        h.register(Arc::new(Echo { manifest: manifest("px") })).unwrap();
-        h.call(&ctx(), "px", "echo", serde_json::json!({"i": 1})).unwrap();
-        h.call(&ctx(), "px", "echo", serde_json::json!({"i": 2})).unwrap();
+        h.register(Arc::new(Echo {
+            manifest: manifest("px"),
+        }))
+        .unwrap();
+        h.call(&ctx(), "px", "echo", serde_json::json!({"i": 1}))
+            .unwrap();
+        h.call(&ctx(), "px", "echo", serde_json::json!({"i": 2}))
+            .unwrap();
         assert!(h.verify_chain().is_ok());
     }
     // Flip one byte inside the SECOND record's JSON body.
@@ -328,9 +364,13 @@ fn corrupt_record_fails_closed() {
 fn anchor_export_verify_and_rewind_detection() {
     let dir = tmpdir("anchor");
     let (h, _log) = persistent_host(&dir);
-    h.register(Arc::new(Echo { manifest: manifest("pa") })).unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("pa"),
+    }))
+    .unwrap();
     for i in 0..3 {
-        h.call(&ctx(), "pa", "echo", serde_json::json!({"i": i})).unwrap();
+        h.call(&ctx(), "pa", "echo", serde_json::json!({"i": i}))
+            .unwrap();
     }
     // Anchor at seq 4 (registration + 3 invocations).
     let anchor = h.export_anchor().unwrap();
@@ -351,7 +391,8 @@ fn anchor_export_verify_and_rewind_detection() {
     assert_eq!(loaded.count, anchor.count);
     // The chain grows past the anchor; the anchor still verifies.
     for i in 3..5 {
-        h.call(&ctx(), "pa", "echo", serde_json::json!({"i": i})).unwrap();
+        h.call(&ctx(), "pa", "echo", serde_json::json!({"i": i}))
+            .unwrap();
     }
     assert!(h.verify_against_anchor(&anchor).is_ok());
     assert!(h.verify_against_anchor(&loaded).is_ok());
@@ -366,8 +407,12 @@ fn anchor_export_verify_and_rewind_detection() {
     h2.set_write_roots(vec![dir2.clone()]).unwrap();
     let log2 = dir2.join("receipts.log");
     h2.enable_receipt_log(log2.to_str().unwrap()).unwrap();
-    h2.register(Arc::new(Echo { manifest: manifest("pa") })).unwrap();
-    h2.call(&ctx(), "pa", "echo", serde_json::json!({"i": 0})).unwrap();
+    h2.register(Arc::new(Echo {
+        manifest: manifest("pa"),
+    }))
+    .unwrap();
+    h2.call(&ctx(), "pa", "echo", serde_json::json!({"i": 0}))
+        .unwrap();
     let err = h2.verify_against_anchor(&anchor).unwrap_err();
     assert!(err.contains("not present"), "got: {err}");
     cleanup(&dir);
@@ -404,7 +449,10 @@ fn crash_mid_invocation_no_phantom_receipt() {
     assert!(h.verify_chain().is_ok());
     let ids: Vec<String> = h.receipts().iter().map(|r| r.id.clone()).collect();
     assert_eq!(ids.len(), 2); // registration + the ONE acknowledged invocation
-    assert!(ids.contains(&acked_id), "acknowledged receipt must be durable");
+    assert!(
+        ids.contains(&acked_id),
+        "acknowledged receipt must be durable"
+    );
     // No phantom: the crashed invocation is absent — exactly 2 receipts.
     assert_eq!(h.receipts()[1].codon, "cp");
     assert_eq!(h.receipts()[1].verdict, organelle_host::CallVerdict::Ok);
@@ -422,8 +470,13 @@ fn enable_requires_approved_write_root() {
     assert!(err.contains("no approved write roots"), "got: {err}");
     // Path escaping the approved root: denied.
     h.set_write_roots(vec![dir.clone()]).unwrap();
-    let err = h.enable_receipt_log("/tmp/org-persist-outside.log").unwrap_err();
-    assert!(err.contains("denied") || err.contains("outside"), "got: {err}");
+    let err = h
+        .enable_receipt_log("/tmp/org-persist-outside.log")
+        .unwrap_err();
+    assert!(
+        err.contains("denied") || err.contains("outside"),
+        "got: {err}"
+    );
     // `..` in the path: denied.
     let sneaky = dir.join("..").join("org-persist-outside2.log");
     let err = h.enable_receipt_log(sneaky.to_str().unwrap()).unwrap_err();
@@ -431,7 +484,8 @@ fn enable_requires_approved_write_root() {
     // Nothing attached after the denials.
     assert!(h.receipt_log_path().is_none());
     // Double-enable: fail closed.
-    h.enable_receipt_log(dir.join("receipts.log").to_str().unwrap()).unwrap();
+    h.enable_receipt_log(dir.join("receipts.log").to_str().unwrap())
+        .unwrap();
     let err = h
         .enable_receipt_log(dir.join("other.log").to_str().unwrap())
         .unwrap_err();
@@ -448,12 +502,18 @@ fn enable_on_mismatched_log_fails_closed() {
     let a = Host::new();
     a.set_write_roots(vec![dir.clone()]).unwrap();
     a.enable_receipt_log(log.to_str().unwrap()).unwrap();
-    a.register(Arc::new(Echo { manifest: manifest("ma") })).unwrap();
+    a.register(Arc::new(Echo {
+        manifest: manifest("ma"),
+    }))
+    .unwrap();
     a.call(&ctx(), "ma", "echo", serde_json::json!({})).unwrap();
     drop(a);
     let b = Host::new();
     b.set_write_roots(vec![dir.clone()]).unwrap();
-    b.register(Arc::new(Echo { manifest: manifest("mb") })).unwrap(); // different chain
+    b.register(Arc::new(Echo {
+        manifest: manifest("mb"),
+    }))
+    .unwrap(); // different chain
     let err = b.enable_receipt_log(log.to_str().unwrap()).unwrap_err();
     assert!(err.contains("does not match"), "got: {err}");
     assert!(b.receipt_log_path().is_none());
@@ -469,7 +529,10 @@ fn log_write_failure_poisons_host() {
     // that is not durable.
     let dir = tmpdir("poison");
     let (h, _log) = persistent_host(&dir);
-    h.register(Arc::new(Echo { manifest: manifest("pf") })).unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("pf"),
+    }))
+    .unwrap();
     h.__test_break_receipt_log();
     // This emission's append fails -> panic("... refusing to serve ...").
     let _ = h.call(&ctx(), "pf", "echo", serde_json::json!({}));

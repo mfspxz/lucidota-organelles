@@ -103,7 +103,9 @@ fn do_request(
     }
     let head_str = String::from_utf8_lossy(&head);
     let mut lines = head_str.lines();
-    let status_line = lines.next().ok_or_else(|| HttpError("empty response".to_string()))?;
+    let status_line = lines
+        .next()
+        .ok_or_else(|| HttpError("empty response".to_string()))?;
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -143,7 +145,12 @@ fn do_request(
     if truncated {
         body_out.truncate(max_bytes);
     }
-    Ok(HttpResponse { status, headers, body: body_out, truncated })
+    Ok(HttpResponse {
+        status,
+        headers,
+        body: body_out,
+        truncated,
+    })
 }
 
 /// Minimal HTTP GET. `max_bytes` caps the body; excess sets `truncated`.
@@ -189,8 +196,12 @@ fn strip_tags(html: &str) -> (String, Option<String>, Vec<String>) {
         if bytes[i] == b'<' {
             if let Some(end) = html[i..].find('>') {
                 let tag = html[i + 1..i + end].trim().to_ascii_lowercase();
-                let tag_name: String =
-                    tag.split_whitespace().next().unwrap_or("").trim_start_matches('/').to_string();
+                let tag_name: String = tag
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches('/')
+                    .to_string();
                 if tag_name == "script" || tag_name == "style" {
                     if tag.starts_with('/') {
                         skip_depth = skip_depth.saturating_sub(1);
@@ -230,10 +241,7 @@ fn strip_tags(html: &str) -> (String, Option<String>, Vec<String>) {
         i += 1;
     }
     // Collapse whitespace.
-    let collapsed = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (collapsed, title, links)
 }
 
@@ -298,9 +306,8 @@ mod tests {
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf);
             let body = vec![b'a'; 5000];
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n"
-            );
+            let resp =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n");
             let _ = s.write_all(resp.as_bytes());
             let _ = s.write_all(&body);
         });
@@ -315,7 +322,11 @@ mod tests {
             <body><h1>Hello <a href="/p">world</a></h1><script>var x=1;</script></body></html>"#;
         let e = extract_text(html);
         assert_eq!(e.title.as_deref(), Some("Hi"));
-        assert!(e.text.contains("Hello") && e.text.contains("world"), "{}", e.text);
+        assert!(
+            e.text.contains("Hello") && e.text.contains("world"),
+            "{}",
+            e.text
+        );
         assert!(!e.text.contains("var x"), "script leaked: {}", e.text);
         assert_eq!(e.links, vec!["/p".to_string()]);
     }
@@ -338,9 +349,13 @@ mod tests {
             let _ = s.write_all(resp.as_bytes());
             let _ = s.write_all(body);
         });
-        let (status, v) =
-            http_post_json(&format!("http://127.0.0.1:{port}/chat"), &serde_json::json!({"m":1}), 3000, 4096)
-                .unwrap();
+        let (status, v) = http_post_json(
+            &format!("http://127.0.0.1:{port}/chat"),
+            &serde_json::json!({"m":1}),
+            3000,
+            4096,
+        )
+        .unwrap();
         assert_eq!(status, 200);
         assert_eq!(v["reply"], serde_json::json!("hi"));
     }

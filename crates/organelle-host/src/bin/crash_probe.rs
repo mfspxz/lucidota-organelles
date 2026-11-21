@@ -95,8 +95,10 @@ fn main() {
     let log_path = logdir.join("receipts.log");
     h.enable_receipt_log(log_path.to_str().expect("utf8"))
         .expect("enable_receipt_log");
-    h.register(Arc::new(Probe { manifest: manifest() }))
-        .expect("register");
+    h.register(Arc::new(Probe {
+        manifest: manifest(),
+    }))
+    .expect("register");
 
     let ctx = CallContext::new("probe", vec![]);
     let ok = h

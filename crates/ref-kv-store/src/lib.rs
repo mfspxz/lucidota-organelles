@@ -81,7 +81,10 @@ pub struct KvStore {
 
 /// Fresh kv-store instance.
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(KvStore { manifest: manifest(), data: Mutex::new(HashMap::new()) })
+    Arc::new(KvStore {
+        manifest: manifest(),
+        data: Mutex::new(HashMap::new()),
+    })
 }
 
 impl Organelle for KvStore {
@@ -133,28 +136,57 @@ mod tests {
     fn host_with(caps_holder: bool) -> (Arc<Host>, CallContext) {
         let h = Host::new();
         h.register(organelle()).unwrap();
-        let caps = if caps_holder { vec!["kv.write".to_string()] } else { vec![] };
+        let caps = if caps_holder {
+            vec!["kv.write".to_string()]
+        } else {
+            vec![]
+        };
         (h, CallContext::new("test", caps))
     }
 
     #[test]
     fn put_get_delete_roundtrip() {
         let (h, ctx) = host_with(true);
-        h.call(&ctx, "kv", "put", serde_json::json!({"key": "a", "value": 1})).unwrap();
-        let got = h.call(&ctx, "kv", "get", serde_json::json!({"key": "a"})).unwrap().output;
+        h.call(
+            &ctx,
+            "kv",
+            "put",
+            serde_json::json!({"key": "a", "value": 1}),
+        )
+        .unwrap();
+        let got = h
+            .call(&ctx, "kv", "get", serde_json::json!({"key": "a"}))
+            .unwrap()
+            .output;
         assert_eq!(got["value"], serde_json::json!(1));
-        let del = h.call(&ctx, "kv", "delete", serde_json::json!({"key": "a"})).unwrap().output;
+        let del = h
+            .call(&ctx, "kv", "delete", serde_json::json!({"key": "a"}))
+            .unwrap()
+            .output;
         assert_eq!(del["existed"], serde_json::json!(true));
-        let gone = h.call(&ctx, "kv", "get", serde_json::json!({"key": "a"})).unwrap().output;
+        let gone = h
+            .call(&ctx, "kv", "get", serde_json::json!({"key": "a"}))
+            .unwrap()
+            .output;
         assert_eq!(gone["found"], serde_json::json!(false));
     }
 
     #[test]
     fn put_without_capability_denied() {
         let (h, ctx) = host_with(false);
-        let e = h.call(&ctx, "kv", "put", serde_json::json!({"key": "a", "value": 1})).unwrap_err();
+        let e = h
+            .call(
+                &ctx,
+                "kv",
+                "put",
+                serde_json::json!({"key": "a", "value": 1}),
+            )
+            .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Denied);
-        let list = h.call(&ctx, "kv", "list", serde_json::json!({})).unwrap().output;
+        let list = h
+            .call(&ctx, "kv", "list", serde_json::json!({}))
+            .unwrap()
+            .output;
         assert_eq!(list["count"], serde_json::json!(0));
     }
 
@@ -162,9 +194,18 @@ mod tests {
     fn list_sorted() {
         let (h, ctx) = host_with(true);
         for k in ["c", "a", "b"] {
-            h.call(&ctx, "kv", "put", serde_json::json!({"key": k, "value": true})).unwrap();
+            h.call(
+                &ctx,
+                "kv",
+                "put",
+                serde_json::json!({"key": k, "value": true}),
+            )
+            .unwrap();
         }
-        let list = h.call(&ctx, "kv", "list", serde_json::json!({})).unwrap().output;
+        let list = h
+            .call(&ctx, "kv", "list", serde_json::json!({}))
+            .unwrap()
+            .output;
         assert_eq!(list["keys"], serde_json::json!(["a", "b", "c"]));
     }
 

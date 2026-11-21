@@ -51,7 +51,9 @@ pub struct TextTransform {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(TextTransform { manifest: manifest() })
+    Arc::new(TextTransform {
+        manifest: manifest(),
+    })
 }
 
 fn slug(s: &str) -> String {
@@ -105,9 +107,14 @@ mod tests {
         let h = Host::new();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
-        h.call(&ctx, "tt", "transform", serde_json::json!({"text": text, "mode": mode}))
-            .unwrap()
-            .output
+        h.call(
+            &ctx,
+            "tt",
+            "transform",
+            serde_json::json!({"text": text, "mode": mode}),
+        )
+        .unwrap()
+        .output
     }
 
     #[test]
@@ -115,7 +122,10 @@ mod tests {
         assert_eq!(call("upper", "hi")["result"], serde_json::json!("HI"));
         assert_eq!(call("lower", "HI")["result"], serde_json::json!("hi"));
         assert_eq!(call("reverse", "abc")["result"], serde_json::json!("cba"));
-        assert_eq!(call("slug", "Hello,  World!")["result"], serde_json::json!("hello-world"));
+        assert_eq!(
+            call("slug", "Hello,  World!")["result"],
+            serde_json::json!("hello-world")
+        );
         assert_eq!(call("trim", "  x  ")["result"], serde_json::json!("x"));
         assert_eq!(call("words", "a b  c")["result"], serde_json::json!(3));
         assert_eq!(call("lines", "a\nb\nc")["result"], serde_json::json!(3));
@@ -127,7 +137,12 @@ mod tests {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h
-            .call(&ctx, "tt", "transform", serde_json::json!({"text": "x", "mode": "nope"}))
+            .call(
+                &ctx,
+                "tt",
+                "transform",
+                serde_json::json!({"text": "x", "mode": "nope"}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Rejected);
     }

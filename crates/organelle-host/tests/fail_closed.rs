@@ -4,9 +4,7 @@
 //! "No silent pass" is asserted by counting: receipts_out - receipts_in
 //! must equal the number of calls attempted, whatever their outcome.
 
-use organelle_host::{
-    CallContext, CallVerdict, Host, HostRef, Organelle, OrganelleError,
-};
+use organelle_host::{CallContext, CallVerdict, Host, HostRef, Organelle, OrganelleError};
 use organelle_manifest::{
     Authority, Contract, MutationClass, OrganelleManifest, ReceiptPolicy, Transport,
     MANIFEST_SCHEMA_VERSION, RECEIPT_ALGORITHM,
@@ -81,7 +79,10 @@ impl Organelle for Probe {
 
 fn host() -> Arc<Host> {
     let h = Host::new();
-    h.register(Arc::new(Probe { manifest: manifest() })).unwrap();
+    h.register(Arc::new(Probe {
+        manifest: manifest(),
+    }))
+    .unwrap();
     h
 }
 
@@ -96,9 +97,14 @@ fn ctx(caps: &[&str]) -> CallContext {
 fn unauthorized_call_denied_with_receipt() {
     let h = host();
     let before = h.receipts().len();
-    let e = h.call(&ctx(&[]), "pb", "armed", serde_json::json!({})).unwrap_err();
+    let e = h
+        .call(&ctx(&[]), "pb", "armed", serde_json::json!({}))
+        .unwrap_err();
     assert_eq!(e.verdict, CallVerdict::Denied);
-    assert!(!e.receipt_id.is_empty(), "denial without receipt = silent pass");
+    assert!(
+        !e.receipt_id.is_empty(),
+        "denial without receipt = silent pass"
+    );
     assert_eq!(h.receipts().len(), before + 1);
     let r = h.receipts().last().unwrap().clone();
     assert_eq!(r.id, e.receipt_id);
@@ -110,12 +116,16 @@ fn malformed_input_rejected_with_receipt() {
     let h = host();
     let before = h.receipts().len();
     // missing required "nonce"
-    let e = h.call(&ctx(&[]), "pb", "ping", serde_json::json!({"nope": 1})).unwrap_err();
+    let e = h
+        .call(&ctx(&[]), "pb", "ping", serde_json::json!({"nope": 1}))
+        .unwrap_err();
     assert_eq!(e.verdict, CallVerdict::Rejected);
     assert!(!e.receipt_id.is_empty());
     assert_eq!(h.receipts().len(), before + 1);
     // wrong type entirely
-    let e2 = h.call(&ctx(&[]), "pb", "ping", serde_json::json!("a string")).unwrap_err();
+    let e2 = h
+        .call(&ctx(&[]), "pb", "ping", serde_json::json!("a string"))
+        .unwrap_err();
     assert_eq!(e2.verdict, CallVerdict::Rejected);
 }
 
@@ -123,8 +133,12 @@ fn malformed_input_rejected_with_receipt() {
 fn unknown_codon_and_op_denied_with_receipt() {
     let h = host();
     let before = h.receipts().len();
-    let e1 = h.call(&ctx(&[]), "xx", "ping", serde_json::json!({})).unwrap_err();
-    let e2 = h.call(&ctx(&[]), "pb", "nope", serde_json::json!({})).unwrap_err();
+    let e1 = h
+        .call(&ctx(&[]), "xx", "ping", serde_json::json!({}))
+        .unwrap_err();
+    let e2 = h
+        .call(&ctx(&[]), "pb", "nope", serde_json::json!({}))
+        .unwrap_err();
     assert_eq!(e1.verdict, CallVerdict::Denied);
     assert_eq!(e2.verdict, CallVerdict::Denied);
     assert!(!e1.receipt_id.is_empty() && !e2.receipt_id.is_empty());
@@ -149,10 +163,10 @@ fn no_silent_pass_across_all_refusal_modes() {
     let h = host();
     let before = h.receipts().len();
     let attempts = [
-        h.call(&ctx(&[]), "pb", "armed", serde_json::json!({})),      // denied: capability
-        h.call(&ctx(&[]), "pb", "ping", serde_json::json!({})),       // rejected: schema
-        h.call(&ctx(&[]), "zz", "ping", serde_json::json!({})),       // denied: codon
-        h.call(&ctx(&[]), "pb", "missing", serde_json::json!({})),    // denied: op
+        h.call(&ctx(&[]), "pb", "armed", serde_json::json!({})), // denied: capability
+        h.call(&ctx(&[]), "pb", "ping", serde_json::json!({})),  // rejected: schema
+        h.call(&ctx(&[]), "zz", "ping", serde_json::json!({})),  // denied: codon
+        h.call(&ctx(&[]), "pb", "missing", serde_json::json!({})), // denied: op
     ];
     let mut receipted = 0;
     for a in attempts {
@@ -169,7 +183,9 @@ fn no_silent_pass_across_all_refusal_modes() {
 #[test]
 fn denial_receipts_are_content_addressed() {
     let h = host();
-    let e = h.call(&ctx(&[]), "zz", "ping", serde_json::json!({})).unwrap_err();
+    let e = h
+        .call(&ctx(&[]), "zz", "ping", serde_json::json!({}))
+        .unwrap_err();
     let r = h.receipts().last().unwrap().clone();
     assert_eq!(r.id, e.receipt_id);
     assert!(r.output_hash.starts_with("denied:"));

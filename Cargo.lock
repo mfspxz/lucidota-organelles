@@ -107,6 +107,7 @@ dependencies = [
  "hex",
  "organelle-host",
  "organelle-manifest",
+ "organelle-typed",
  "ref-common",
  "ref-file-cas",
  "ref-geo-point",
@@ -120,6 +121,8 @@ dependencies = [
  "ref-scrape-extract",
  "ref-text-transform",
  "ref-time-oracle",
+ "ref-typed-commit",
+ "ref-typed-hash",
  "serde",
  "serde_json",
  "surface-mcp",
@@ -147,6 +150,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "organelle-typed"
+version = "1.0.0"
+dependencies = [
+ "organelle-host",
+ "organelle-manifest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -299,6 +312,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-typed-commit"
+version = "1.0.0"
+dependencies = [
+ "organelle-host",
+ "organelle-manifest",
+ "organelle-typed",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ref-typed-hash"
+version = "1.0.0"
+dependencies = [
+ "organelle-host",
+ "organelle-manifest",
+ "organelle-typed",
+ "ref-hash-seal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +401,7 @@ dependencies = [
  "hex",
  "organelle-host",
  "organelle-manifest",
+ "organelle-typed",
  "ref-common",
  "ref-file-cas",
  "ref-geo-point",
@@ -378,6 +415,7 @@ dependencies = [
  "ref-scrape-extract",
  "ref-text-transform",
  "ref-time-oracle",
+ "ref-typed-hash",
  "serde",
  "serde_json",
 ]
@@ -388,8 +426,10 @@ version = "1.0.0"
 dependencies = [
  "organelle-host",
  "organelle-manifest",
+ "organelle-typed",
  "ref-kv-store",
  "ref-text-transform",
+ "ref-typed-hash",
  "serde",
  "serde_json",
 ]
@@ -400,8 +440,10 @@ version = "1.0.0"
 dependencies = [
  "organelle-host",
  "organelle-manifest",
+ "organelle-typed",
  "ref-kv-store",
  "ref-text-transform",
+ "ref-typed-hash",
  "serde",
  "serde_json",
 ]

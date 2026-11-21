@@ -1,0 +1,11 @@
+[package]
+name = "organelle-typed"
+version = "1.0.0"
+edition = "2021"
+description = "GO-50 Phase 1 (family F3): typed fabric — OrganelleManifestV1, ontology-lock validation, TypedOrganelle trait, JSON-erased adapter, universal dispatcher"
+
+[dependencies]
+organelle-manifest = { workspace = true }
+organelle-host = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "ref-typed-commit"
+version = "1.0.0"
+edition = "2021"
+description = "GO-50 Phase 1 (family F5): reference typed organelle — attested commit (codon tc), content-addressed append-only commit log attested by host receipts"
+
+[dependencies]
+organelle-manifest = { workspace = true }
+organelle-host = { workspace = true }
+organelle-typed = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -58,9 +58,8 @@
 
 use organelle_host::{CallContext, HostRef, Organelle, OrganelleError};
 use organelle_manifest::{
-    canonical_json, sha256_hex, utc_now_iso, Authority, Contract, MutationClass,
-    OrganelleManifest, ReceiptPolicy, Transport, Valence, MANIFEST_SCHEMA_VERSION,
-    RECEIPT_ALGORITHM,
+    canonical_json, sha256_hex, utc_now_iso, Authority, Contract, MutationClass, OrganelleManifest,
+    ReceiptPolicy, Transport, Valence, MANIFEST_SCHEMA_VERSION, RECEIPT_ALGORITHM,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -245,9 +244,8 @@ fn resolve_probe_artifact(
             "defeating probe artifact is not a file",
         ));
     }
-    let bytes = std::fs::read(&canon).map_err(|e| {
-        OrganelleError::denied(format!("defeating probe artifact unreadable: {e}"))
-    })?;
+    let bytes = std::fs::read(&canon)
+        .map_err(|e| OrganelleError::denied(format!("defeating probe artifact unreadable: {e}")))?;
     if sha256_hex(&bytes) != payload_hash {
         return Err(OrganelleError::denied(
             "defeating probe artifact hash does not match payload_hash: invented probes are not evidence",
@@ -258,17 +256,21 @@ fn resolve_probe_artifact(
 
 /// Read-only variant used by `verify`: same checks, failure as a string so
 /// the caller can report `ok:false` instead of erroring the call.
-fn check_probe_artifact(root: &Path, artifact_path: &str, payload_hash: &str) -> Result<(), String> {
-    let canon = Path::new(artifact_path).canonicalize().map_err(|e| {
-        format!("defeating probe artifact unresolvable ({artifact_path}): {e}")
-    })?;
+fn check_probe_artifact(
+    root: &Path,
+    artifact_path: &str,
+    payload_hash: &str,
+) -> Result<(), String> {
+    let canon = Path::new(artifact_path)
+        .canonicalize()
+        .map_err(|e| format!("defeating probe artifact unresolvable ({artifact_path}): {e}"))?;
     if !canon.starts_with(root) {
         return Err(format!(
             "defeating probe artifact escapes the grant-bound root: {artifact_path}"
         ));
     }
-    let bytes = std::fs::read(&canon)
-        .map_err(|e| format!("defeating probe artifact unreadable: {e}"))?;
+    let bytes =
+        std::fs::read(&canon).map_err(|e| format!("defeating probe artifact unreadable: {e}"))?;
     if sha256_hex(&bytes) != payload_hash {
         return Err(
             "defeating probe artifact hash does not match payload_hash: invented probes are not evidence"
@@ -283,8 +285,7 @@ fn check_probe_artifact(root: &Path, artifact_path: &str, payload_hash: &str) ->
 // ---------------------------------------------------------------------------
 
 /// Genesis prev-hash for seq 0.
-const GENESIS_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Status values. Trinary discipline: a claim is exactly one of these.
 pub const STATUS_INSTANCE_ONLY: &str = "INSTANCE_ONLY";
@@ -315,10 +316,7 @@ fn check_store_path(path: &Path) -> Result<(), OrganelleError> {
     if path.as_os_str().is_empty() {
         return Err(OrganelleError::denied("store_path must not be empty"));
     }
-    if path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(OrganelleError::denied("store_path must not contain .."));
     }
     Ok(())
@@ -436,9 +434,9 @@ fn verify_store(path: &str) -> Result<Value, OrganelleError> {
     let canon_store = store_path.canonicalize().map_err(|e| {
         OrganelleError::failed(format!("verify: cannot canonicalize store path: {e}"))
     })?;
-    let root = canon_store.parent().ok_or_else(|| {
-        OrganelleError::failed("verify: store path has no parent directory")
-    })?;
+    let root = canon_store
+        .parent()
+        .ok_or_else(|| OrganelleError::failed("verify: store path has no parent directory"))?;
 
     for e in &entries {
         let kind = e.entry["kind"].as_str().unwrap_or("");
@@ -653,11 +651,7 @@ impl ClaimReconciler {
         }))
     }
 
-    fn op_close_store(
-        &self,
-        ctx: &CallContext,
-        input: &Value,
-    ) -> Result<Value, OrganelleError> {
+    fn op_close_store(&self, ctx: &CallContext, input: &Value) -> Result<Value, OrganelleError> {
         let g = self.resolve_grant(ctx, input)?;
         self.grants.lock().unwrap().remove(&g.token);
         Ok(json!({"ok": true, "revoked": g.grant_id}))
@@ -738,9 +732,10 @@ impl ClaimReconciler {
             .ok_or_else(|| OrganelleError::denied("defect_id required"))?;
         let entries = read_store(&grant.store_path)?;
 
-        if entries.iter().any(|e| {
-            e.entry["kind"] == KIND_DEFECT_INGESTED && e.entry["defect_id"] == defect_id
-        }) {
+        if entries
+            .iter()
+            .any(|e| e.entry["kind"] == KIND_DEFECT_INGESTED && e.entry["defect_id"] == defect_id)
+        {
             return Err(OrganelleError::denied(format!(
                 "defect_id {defect_id} already recorded; defect records are permanent"
             )));
@@ -845,9 +840,8 @@ impl ClaimReconciler {
         let claim_id = non_empty_str(input, "claim_id")
             .ok_or_else(|| OrganelleError::denied("claim_id required"))?;
         let entries = read_store(Path::new(&path))?;
-        let original = claim_ingested_entry(&entries, &claim_id).ok_or_else(|| {
-            OrganelleError::not_found(format!("unknown claim {claim_id}"))
-        })?;
+        let original = claim_ingested_entry(&entries, &claim_id)
+            .ok_or_else(|| OrganelleError::not_found(format!("unknown claim {claim_id}")))?;
 
         let mut status = STATUS_INSTANCE_ONLY.to_string();
         let mut terminal_seq: Option<u64> = None;
@@ -1073,10 +1067,13 @@ impl ClaimReconciler {
             .ok_or_else(|| OrganelleError::denied("claim_id required"))?;
         let entries = read_store(&grant.store_path)?;
         if claim_ingested_seq(&entries, &claim_id).is_none() {
-            return Err(OrganelleError::not_found(format!("unknown claim {claim_id}")));
+            return Err(OrganelleError::not_found(format!(
+                "unknown claim {claim_id}"
+            )));
         }
 
-        let reasons = Self::closure_reasons(&entries, &claim_id, &input["evidence"], &grant.grant_id);
+        let reasons =
+            Self::closure_reasons(&entries, &claim_id, &input["evidence"], &grant.grant_id);
         if !reasons.is_empty() {
             // Refusal is an error to the caller AND an audit event in the
             // store: it is not a claim, and the organelle certifies nothing.
@@ -1183,23 +1180,15 @@ mod tests {
         // The organelle approves store paths through the host membrane:
         // tests allowlist the temp dir.
         h.set_write_roots(vec![std::env::temp_dir()]).unwrap();
-        let ctx = CallContext::new(
-            "unit-test",
-            caps.iter().map(|c| c.to_string()).collect(),
-        );
+        let ctx = CallContext::new("unit-test", caps.iter().map(|c| c.to_string()).collect());
         (h, ctx)
     }
 
     /// Open a store through the grant flow; returns the issued grant token.
     fn open_store(h: &Arc<Host>, ctx: &CallContext, store: &str) -> String {
-        h.call(
-            ctx,
-            "cr",
-            "open-store",
-            json!({"store_path": store}),
-        )
-        .unwrap()
-        .output["grant_token"]
+        h.call(ctx, "cr", "open-store", json!({"store_path": store}))
+            .unwrap()
+            .output["grant_token"]
             .as_str()
             .unwrap()
             .to_string()
@@ -1269,13 +1258,24 @@ mod tests {
         assert!(m.contract("verify").is_some());
         assert!(m.contract("delete").is_none());
         // Mutating ops bind grant_token, never a raw store_path.
-        for op in ["open-store", "ingest-claim", "ingest-defect", "request-class-closure"] {
+        for op in [
+            "open-store",
+            "ingest-claim",
+            "ingest-defect",
+            "request-class-closure",
+        ] {
             let c = m.contract(op).unwrap();
             if op == "open-store" {
-                assert!(c.input_schema["required"].as_array().unwrap().contains(&json!("store_path")));
+                assert!(c.input_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("store_path")));
             } else {
                 assert!(
-                    c.input_schema["required"].as_array().unwrap().contains(&json!("grant_token")),
+                    c.input_schema["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("grant_token")),
                     "op {op} must require grant_token"
                 );
             }
@@ -1294,9 +1294,13 @@ mod tests {
         let store = tmp_store("ids");
         let (h, ctx) = host_with_caps(&["claims.write"]);
         let (token, grant_id) = open_store_full(&h, &ctx, &store);
-        let r1 = h.call(&ctx, "cr", "ingest-claim", claim_input(&token)).unwrap();
+        let r1 = h
+            .call(&ctx, "cr", "ingest-claim", claim_input(&token))
+            .unwrap();
         assert_eq!(r1.output["claim_id"], json!("FC-1"));
-        let r2 = h.call(&ctx, "cr", "ingest-claim", claim_input(&token)).unwrap();
+        let r2 = h
+            .call(&ctx, "cr", "ingest-claim", claim_input(&token))
+            .unwrap();
         assert_eq!(r2.output["claim_id"], json!("FC-2"));
         assert_eq!(r2.output["scope"], json!("INSTANCE_ONLY"));
         // Default scope is instance-only even when a scope field is omitted.
@@ -1340,7 +1344,8 @@ mod tests {
         assert_eq!(v0.output["ok"], json!(true));
         assert_eq!(v0.output["entries"], json!(0));
         let token = open_store(&h, &ctx, &store);
-        h.call(&ctx, "cr", "ingest-claim", claim_input(&token)).unwrap();
+        h.call(&ctx, "cr", "ingest-claim", claim_input(&token))
+            .unwrap();
         let v1 = h
             .call(&ctx, "cr", "verify", json!({"store_path": store}))
             .unwrap();
@@ -1362,7 +1367,12 @@ mod tests {
         // Outside the allowlisted root.
         let (h, ctx) = host_with_caps(&["claims.write"]);
         assert!(h
-            .call(&ctx, "cr", "open-store", json!({"store_path": "/etc/cr-evil.jsonl"}))
+            .call(
+                &ctx,
+                "cr",
+                "open-store",
+                json!({"store_path": "/etc/cr-evil.jsonl"})
+            )
             .is_err());
         // No roots configured at all: default deny.
         let h2 = Host::new();
@@ -1396,12 +1406,16 @@ mod tests {
         // Same host, same capabilities, different caller: the token is not
         // a delegation mechanism.
         let ctx_b = CallContext::new("someone-else", vec!["claims.write".to_string()]);
-        assert!(h.call(&ctx_b, "cr", "ingest-claim", claim_input(&token)).is_err());
+        assert!(h
+            .call(&ctx_b, "cr", "ingest-claim", claim_input(&token))
+            .is_err());
         assert!(h
             .call(&ctx_b, "cr", "close-store", json!({"grant_token": token}))
             .is_err());
         // The issuing caller works fine.
-        assert!(h.call(&ctx_a, "cr", "ingest-claim", claim_input(&token)).is_ok());
+        assert!(h
+            .call(&ctx_a, "cr", "ingest-claim", claim_input(&token))
+            .is_ok());
     }
 
     #[test]
@@ -1409,7 +1423,8 @@ mod tests {
         let store = tmp_store("probe");
         let (h, ctx) = host_with_caps(&["claims.write"]);
         let token = open_store(&h, &ctx, &store);
-        h.call(&ctx, "cr", "ingest-claim", claim_input(&token)).unwrap();
+        h.call(&ctx, "cr", "ingest-claim", claim_input(&token))
+            .unwrap();
 
         // Invented hash: artifact exists but does not match payload_hash.
         let (apath, _real) = probe_artifact("mismatch", b"real-bytes");
@@ -1482,14 +1497,12 @@ mod tests {
 
     #[test]
     fn verify_fails_when_probe_artifact_removed_or_tampered() {
-        for (tag, mutate) in [
-            ("gone", "remove"),
-            ("tampered", "rewrite"),
-        ] {
+        for (tag, mutate) in [("gone", "remove"), ("tampered", "rewrite")] {
             let store = tmp_store(&format!("pv-{tag}"));
             let (h, ctx) = host_with_caps(&["claims.write"]);
             let token = open_store(&h, &ctx, &store);
-            h.call(&ctx, "cr", "ingest-claim", claim_input(&token)).unwrap();
+            h.call(&ctx, "cr", "ingest-claim", claim_input(&token))
+                .unwrap();
             let (apath, ph) = probe_artifact(&format!("pv-{tag}"), b"probe-evidence");
             h.call(
                 &ctx,
@@ -1513,7 +1526,10 @@ mod tests {
                 .unwrap();
             assert_eq!(v.output["ok"], json!(false), "tag={tag}");
             assert!(
-                v.output["reason"].as_str().unwrap().contains("probe artifact"),
+                v.output["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("probe artifact"),
                 "tag={tag} reason: {}",
                 v.output["reason"]
             );
@@ -1525,7 +1541,8 @@ mod tests {
         let store = tmp_store("selfatt");
         let (h, ctx) = host_with_caps(&["claims.write", "claims.class_close"]);
         let token_a = open_store(&h, &ctx, &store);
-        h.call(&ctx, "cr", "ingest-claim", claim_input(&token_a)).unwrap();
+        h.call(&ctx, "cr", "ingest-claim", claim_input(&token_a))
+            .unwrap();
 
         // Same grant records and attests: refused.
         let err = h
@@ -1536,7 +1553,11 @@ mod tests {
                 json!({"grant_token": token_a, "claim_id": "FC-1", "evidence": good_evidence()}),
             )
             .unwrap_err();
-        assert!(err.reason.contains("self-attestation"), "reason: {}", err.reason);
+        assert!(
+            err.reason.contains("self-attestation"),
+            "reason: {}",
+            err.reason
+        );
 
         // A fresh grant attests: the closure ceremony is a distinct
         // authorization event.
@@ -1595,7 +1616,10 @@ mod tests {
             .unwrap();
         assert_eq!(v.output["ok"], json!(false));
         assert!(
-            v.output["reason"].as_str().unwrap().contains("self-attested"),
+            v.output["reason"]
+                .as_str()
+                .unwrap()
+                .contains("self-attested"),
             "reason: {}",
             v.output["reason"]
         );
@@ -1622,7 +1646,9 @@ mod tests {
             .call(&ctx, "cr", "close-store", json!({"grant_token": token}))
             .unwrap();
         assert_eq!(r.output["ok"], json!(true));
-        assert!(h.call(&ctx, "cr", "ingest-claim", claim_input(&token)).is_err());
+        assert!(h
+            .call(&ctx, "cr", "ingest-claim", claim_input(&token))
+            .is_err());
         // Double close is also rejected (unknown token now).
         assert!(h
             .call(&ctx, "cr", "close-store", json!({"grant_token": token}))
@@ -1648,7 +1674,10 @@ mod tests {
         assert_eq!(out["issued_to"], json!("unit-test"));
         let exp = out["expires_at"].as_u64().unwrap();
         let now = now_unix();
-        assert!(exp >= now + 100 && exp <= now + 140, "expires_at={exp} now={now}");
+        assert!(
+            exp >= now + 100 && exp <= now + 140,
+            "expires_at={exp} now={now}"
+        );
         // Tokens are unguessable and unique per open.
         let t2 = open_store(&h, &ctx, &store);
         assert_ne!(out["grant_token"].as_str().unwrap(), t2);

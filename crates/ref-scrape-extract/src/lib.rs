@@ -53,7 +53,9 @@ pub struct ScrapeExtract {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(ScrapeExtract { manifest: manifest() })
+    Arc::new(ScrapeExtract {
+        manifest: manifest(),
+    })
 }
 
 impl Organelle for ScrapeExtract {
@@ -128,12 +130,14 @@ mod tests {
     fn extract_local_page() {
         let port = serve_once();
         let h = Host::new();
-        h.set_egress_policy(
-            organelle_host::EgressPolicy::allowlist(&["127.0.0.1"]).unwrap(),
-        );
+        h.set_egress_policy(organelle_host::EgressPolicy::allowlist(&["127.0.0.1"]).unwrap());
         let out = extract_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap();
         assert_eq!(out["title"], serde_json::json!("Fixture"));
-        assert!(out["text"].as_str().unwrap().contains("Hello"), "{}", out["text"]);
+        assert!(
+            out["text"].as_str().unwrap().contains("Hello"),
+            "{}",
+            out["text"]
+        );
         assert!(!out["text"].as_str().unwrap().contains("bad()"));
         assert_eq!(out["links"], serde_json::json!(["/x"]));
     }
@@ -142,9 +146,7 @@ mod tests {
     fn disallowed_host_denied() {
         let port = serve_once();
         let h = Host::new();
-        h.set_egress_policy(
-            organelle_host::EgressPolicy::allowlist(&["example.com"]).unwrap(),
-        );
+        h.set_egress_policy(organelle_host::EgressPolicy::allowlist(&["example.com"]).unwrap());
         let e = extract_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Failed);
         assert!(e.reason.contains("egress denied"), "{}", e.reason);

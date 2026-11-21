@@ -9,7 +9,9 @@
 //! others deny — or denies with a different verdict — fails the matrix.
 
 use crate::{build_host, TransportAdapter};
-use organelle_host::{CallVerdict, Host, Organelle, OrganelleError, Receipt, ReceiptKind, RoutePolicy};
+use organelle_host::{
+    CallVerdict, Host, Organelle, OrganelleError, Receipt, ReceiptKind, RoutePolicy,
+};
 use organelle_manifest::{
     Authority, Contract, MutationClass, OrganelleManifest, ReceiptPolicy, Transport, Valence,
     MANIFEST_SCHEMA_VERSION, RECEIPT_ALGORITHM,
@@ -40,6 +42,9 @@ pub enum HostileToken {
     Expired,
     /// Not a grant at all.
     Malformed,
+    /// Empty string — the no-grant presentation. Must deny as a
+    /// malformed grant, never default-allow onto the native path.
+    Empty,
     /// Honestly issued grant — the attack is in the input or the arrival
     /// transport, not the token.
     Honest,
@@ -63,7 +68,11 @@ pub enum HostileExpect {
 
 impl HostileExpect {
     fn deny(needle: &'static str, verdict: CallVerdict) -> Self {
-        HostileExpect::Deny { needle, verdict, compare_output_hash: true }
+        HostileExpect::Deny {
+            needle,
+            verdict,
+            compare_output_hash: true,
+        }
     }
 }
 
@@ -101,9 +110,18 @@ fn escalate_caps(grant: &str) -> String {
     let mut payload: Value =
         serde_json::from_slice(&hex::decode(payload_hex).expect("grant payload hex"))
             .expect("grant payload json");
-    payload["caps"] =
-        serde_json::json!(["kv.write", "admin.*", "ledger.write", "net.fetch", "model.call"]);
-    format!("{}.{}", hex::encode(organelle_manifest::canonical_json(&payload)), tag)
+    payload["caps"] = serde_json::json!([
+        "kv.write",
+        "admin.*",
+        "ledger.write",
+        "net.fetch",
+        "model.call"
+    ]);
+    format!(
+        "{}.{}",
+        hex::encode(organelle_manifest::canonical_json(&payload)),
+        tag
+    )
 }
 
 /// Build the token this hostile case presents, minted (then attacked)
@@ -119,6 +137,7 @@ pub fn build_hostile_token(host: &Host, case: &HostileCase) -> String {
         HostileToken::CrossOrganelle => host.issue_scoped_grant(sub, "kv", caps, 300),
         HostileToken::Expired => host.issue_grant(sub, caps, 0),
         HostileToken::Malformed => "not-a-grant".to_string(),
+        HostileToken::Empty => String::new(),
         HostileToken::Honest => host.issue_grant(sub, caps, 300),
     }
 }
@@ -284,10 +303,16 @@ impl Organelle for NestedProbe {
 /// `vk` route to v1 (the version that requires `vk.admin`).
 pub fn register_hostile_organelles(host: &Arc<Host>) {
     host.register(Arc::new(NativeOnly)).expect("nt registers");
-    host.register(Arc::new(VersionSkew { version: "1.0.0", require_admin: true }))
-        .expect("vk 1.0.0 registers");
-    host.register(Arc::new(VersionSkew { version: "2.0.0", require_admin: false }))
-        .expect("vk 2.0.0 registers");
+    host.register(Arc::new(VersionSkew {
+        version: "1.0.0",
+        require_admin: true,
+    }))
+    .expect("vk 1.0.0 registers");
+    host.register(Arc::new(VersionSkew {
+        version: "2.0.0",
+        require_admin: false,
+    }))
+    .expect("vk 2.0.0 registers");
     host.set_route("vk", RoutePolicy::Pinned("1.0.0".to_string()))
         .expect("vk route pins to 1.0.0");
     host.register(Arc::new(NestedProbe)).expect("nx registers");
@@ -345,10 +370,7 @@ pub fn build_hostile_cases(inside_ledger: &str, outside_ledger: &str) -> Vec<Hos
             op: "put",
             input: serde_json::json!({"key": "hx", "value": 1}),
             capabilities: kvw.clone(),
-            expect: HostileExpect::deny(
-                "does not match grant subject",
-                CallVerdict::Denied,
-            ),
+            expect: HostileExpect::deny("does not match grant subject", CallVerdict::Denied),
             only: None,
         },
         HostileCase {
@@ -483,6 +505,142 @@ pub fn build_hostile_cases(inside_ledger: &str, outside_ledger: &str) -> Vec<Hos
     ]
 }
 
+/// Typed hostile suite (GO-50 Phase 1, family F5 — closes F4-G6).
+/// Same attacks as [`build_hostile_cases`], aimed at the TYPED
+/// organelles (`th`, `tc`) through the dispatcher's typed projections,
+/// so the typed adapters' `hostile_call` implementations are actually
+/// matrix-run instead of merely implemented. The grant-attack needles
+/// are the host's own denial reasons, which the typed surfaces carry
+/// verbatim in their error text (single `verdict()`/`Display` mapping
+/// in `organelle-typed`); the `tc.commit` case adds the capability
+/// gate of a typed Write op, which the untyped matrix cannot cover.
+pub fn build_typed_hostile_cases() -> Vec<HostileCase> {
+    let sha = serde_json::json!({"text": "abc"});
+    vec![
+        HostileCase {
+            name: "typed-forged-grant",
+            token: HostileToken::Forged,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("grant signature invalid", CallVerdict::Denied),
+            only: None,
+        },
+        HostileCase {
+            name: "typed-escalated-caps",
+            token: HostileToken::EscalatedCaps,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("grant signature invalid", CallVerdict::Denied),
+            only: None,
+        },
+        HostileCase {
+            name: "typed-wrong-caller-grant",
+            token: HostileToken::WrongCaller,
+            caller_claim: "mallory",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("does not match grant subject", CallVerdict::Denied),
+            only: None,
+        },
+        HostileCase {
+            name: "typed-replayed-single-use-grant",
+            token: HostileToken::ReplayedSingleUse,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("already used (replay)", CallVerdict::Denied),
+            only: None,
+        },
+        HostileCase {
+            name: "typed-expired-grant",
+            token: HostileToken::Expired,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("grant expired", CallVerdict::Denied),
+            only: None,
+        },
+        HostileCase {
+            name: "typed-malformed-grant",
+            token: HostileToken::Malformed,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("malformed grant", CallVerdict::Denied),
+            only: None,
+        },
+        // Grant scoped (audience) to kv, presented to th: the grant's
+        // domain cannot escape its intended organelle — on the typed
+        // path as on the untyped one.
+        HostileCase {
+            name: "typed-cross-organelle-grant",
+            token: HostileToken::CrossOrganelle,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("grant scoped to organelle", CallVerdict::Denied),
+            only: None,
+        },
+        // tc.commit is Write + requires tc.commit: an honest grant
+        // with no caps must deny on every typed transport.
+        HostileCase {
+            name: "typed-missing-capability-commit",
+            token: HostileToken::Honest,
+            caller_claim: "equivalence",
+            codon: "tc",
+            op: "commit",
+            input: serde_json::json!({"key": "hx", "value": 1}),
+            capabilities: vec![],
+            expect: HostileExpect::deny("missing capability", CallVerdict::Denied),
+            only: None,
+        },
+        // F6: an empty grant is a malformed grant on every typed
+        // transport — never a silent fall-through to the native
+        // (grantless) path.
+        HostileCase {
+            name: "typed-empty-grant",
+            token: HostileToken::Empty,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha.clone(),
+            capabilities: vec![],
+            expect: HostileExpect::deny("malformed grant", CallVerdict::Denied),
+            only: None,
+        },
+        // Positive control: the same honest grant over th.sha256 (a
+        // ReadOnly op) succeeds, proving the denials above are the
+        // attacks, not a broken typed path.
+        HostileCase {
+            name: "typed-honest-call-ok",
+            token: HostileToken::Honest,
+            caller_claim: "equivalence",
+            codon: "th",
+            op: "sha256",
+            input: sha,
+            capabilities: vec![],
+            expect: HostileExpect::Allow,
+            only: None,
+        },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -502,20 +660,19 @@ pub struct HostileReport {
 
 impl HostileReport {
     pub fn all_green(&self) -> bool {
-        self.transports.iter().all(|t| t.failed == 0)
-            && self.cross_transport_mismatches.is_empty()
+        self.transports.iter().all(|t| t.failed == 0) && self.cross_transport_mismatches.is_empty()
     }
 
     pub fn total_assertions(&self) -> usize {
-        self.transports.iter().map(|t| t.passed + t.failed).sum::<usize>()
+        self.transports
+            .iter()
+            .map(|t| t.passed + t.failed)
+            .sum::<usize>()
             + self.cross_transport_mismatches.len()
     }
 
     pub fn summary(&self) -> String {
-        let mut s = format!(
-            "hostile equivalence: {} cases x transports\n",
-            self.cases
-        );
+        let mut s = format!("hostile equivalence: {} cases x transports\n", self.cases);
         for t in &self.transports {
             s.push_str(&format!(
                 "  {:12} passed {:3} failed {:3}\n",
@@ -528,7 +685,11 @@ impl HostileReport {
         for m in &self.cross_transport_mismatches {
             s.push_str(&format!("  CROSS-MISMATCH: {m}\n"));
         }
-        s.push_str(if self.all_green() { "  VERDICT: GREEN\n" } else { "  VERDICT: RED\n" });
+        s.push_str(if self.all_green() {
+            "  VERDICT: GREEN\n"
+        } else {
+            "  VERDICT: RED\n"
+        });
         s
     }
 }
@@ -553,7 +714,11 @@ fn shape_of(r: &Receipt, compare_output_hash: bool) -> ReceiptShape {
         kind: r.kind,
         codon: r.codon.clone(),
         op: r.op.clone(),
-        output_hash: if compare_output_hash { Some(r.output_hash.clone()) } else { None },
+        output_hash: if compare_output_hash {
+            Some(r.output_hash.clone())
+        } else {
+            None
+        },
     }
 }
 
@@ -616,7 +781,14 @@ pub fn run_hostile_equivalence(
             }
             let res = adapter.hostile_call(case);
             match (&case.expect, res) {
-                (HostileExpect::Deny { needle, verdict, compare_output_hash }, Err(msg)) => {
+                (
+                    HostileExpect::Deny {
+                        needle,
+                        verdict,
+                        compare_output_hash,
+                    },
+                    Err(msg),
+                ) => {
                     if !msg.contains(needle) {
                         rep.failed += 1;
                         rep.failures.push(format!(
@@ -695,5 +867,9 @@ pub fn run_hostile_equivalence(
         }
     }
 
-    HostileReport { cases: cases.len(), transports: reports, cross_transport_mismatches: mismatches }
+    HostileReport {
+        cases: cases.len(),
+        transports: reports,
+        cross_transport_mismatches: mismatches,
+    }
 }

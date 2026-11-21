@@ -64,7 +64,9 @@ pub struct ModelCall {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(ModelCall { manifest: manifest() })
+    Arc::new(ModelCall {
+        manifest: manifest(),
+    })
 }
 
 fn stub_reply(messages: &Value) -> String {
@@ -109,9 +111,7 @@ impl Organelle for ModelCall {
                 match ref_common::http_post_json(&url, &body, 30_000, 1_048_576) {
                     Ok((status, v)) => {
                         if !(200..300).contains(&status) {
-                            return Err(OrganelleError::failed(format!(
-                                "provider http {status}"
-                            )));
+                            return Err(OrganelleError::failed(format!("provider http {status}")));
                         }
                         let reply = v["choices"][0]["message"]["content"]
                             .as_str()
@@ -151,7 +151,14 @@ mod tests {
         let ctx = CallContext::new("test", vec!["model.call".to_string()]);
         // Ensure stub mode regardless of ambient env.
         std::env::remove_var("MODEL_API_URL");
-        h.call(&ctx, "mc", "chat", serde_json::json!({"messages": messages})).unwrap().output
+        h.call(
+            &ctx,
+            "mc",
+            "chat",
+            serde_json::json!({"messages": messages}),
+        )
+        .unwrap()
+        .output
     }
 
     #[test]
@@ -190,14 +197,16 @@ mod tests {
         std::env::set_var("MODEL_API_URL", format!("http://127.0.0.1:{port}"));
         let h = Host::new();
         // P1 lane 3: the live provider path needs the endpoint allowlisted.
-        h.set_egress_policy(
-            organelle_host::EgressPolicy::allowlist(&["127.0.0.1"]).unwrap(),
-        );
+        h.set_egress_policy(organelle_host::EgressPolicy::allowlist(&["127.0.0.1"]).unwrap());
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec!["model.call".to_string()]);
         let out = h
-            .call(&ctx, "mc", "chat",
-                serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "model": "t"}))
+            .call(
+                &ctx,
+                "mc",
+                "chat",
+                serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "model": "t"}),
+            )
             .unwrap()
             .output;
         std::env::remove_var("MODEL_API_URL");
@@ -211,8 +220,12 @@ mod tests {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h
-            .call(&ctx, "mc", "chat",
-                serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}))
+            .call(
+                &ctx,
+                "mc",
+                "chat",
+                serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Denied);
     }

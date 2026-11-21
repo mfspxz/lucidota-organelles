@@ -52,7 +52,9 @@ pub struct EgressPolicy {
 impl EgressPolicy {
     /// Deny everything. This is also the `Default`.
     pub fn deny_all() -> Self {
-        EgressPolicy { allowed: Vec::new() }
+        EgressPolicy {
+            allowed: Vec::new(),
+        }
     }
 
     /// Parse an allowlist. Entries are `example.com` (exact host) or
@@ -160,10 +162,7 @@ pub fn resolve_write_path(roots: &[PathBuf], raw: &str) -> Result<PathBuf, Strin
         return Err("write denied: empty path".to_string());
     }
     let p = Path::new(raw);
-    if p
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("write denied: path must not contain `..`".to_string());
     }
     let abs = if p.is_absolute() {
@@ -220,7 +219,10 @@ mod tests {
 
     fn tmp_root(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("organelle-policy-test-{tag}-{}", std::process::id()));
+        p.push(format!(
+            "organelle-policy-test-{tag}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p.canonicalize().unwrap()
@@ -255,7 +257,16 @@ mod tests {
 
     #[test]
     fn malformed_patterns_refused_wholesale() {
-        for bad in ["", "*.  ", "exa mple.com", "*.*.com", "a/b", "h:1", "@x", ".lead"] {
+        for bad in [
+            "",
+            "*.  ",
+            "exa mple.com",
+            "*.*.com",
+            "a/b",
+            "h:1",
+            "@x",
+            ".lead",
+        ] {
             assert!(EgressPolicy::allowlist(&[bad]).is_err(), "pattern {bad:?}");
         }
         // One bad entry poisons the whole allowlist (fail-closed).
@@ -264,12 +275,24 @@ mod tests {
 
     #[test]
     fn host_extraction() {
-        assert_eq!(egress_host_of("http://example.com/x").unwrap(), "example.com");
-        assert_eq!(egress_host_of("http://EXAMPLE.com:8080/x").unwrap(), "example.com");
+        assert_eq!(
+            egress_host_of("http://example.com/x").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            egress_host_of("http://EXAMPLE.com:8080/x").unwrap(),
+            "example.com"
+        );
         assert_eq!(egress_host_of("http://127.0.0.1:1/").unwrap(), "127.0.0.1");
-        assert_eq!(egress_host_of("http://user@example.com/").unwrap(), "example.com");
+        assert_eq!(
+            egress_host_of("http://user@example.com/").unwrap(),
+            "example.com"
+        );
         assert_eq!(egress_host_of("http://[::1]:8080/x").unwrap(), "::1");
-        assert_eq!(egress_host_of("https://example.com/").unwrap(), "example.com");
+        assert_eq!(
+            egress_host_of("https://example.com/").unwrap(),
+            "example.com"
+        );
         for bad in ["", "no-scheme", "http://", "http:///x", "http://:8080/"] {
             assert!(egress_host_of(bad).is_err(), "url {bad:?}");
         }
@@ -281,7 +304,8 @@ mod tests {
     fn write_inside_root_allowed() {
         let root = tmp_root("wok");
         let target = root.join("sub").join("f.jsonl");
-        let got = resolve_write_path(std::slice::from_ref(&root), target.to_str().unwrap()).unwrap();
+        let got =
+            resolve_write_path(std::slice::from_ref(&root), target.to_str().unwrap()).unwrap();
         assert_eq!(got, target);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -289,10 +313,14 @@ mod tests {
     #[test]
     fn write_outside_root_denied() {
         let root = tmp_root("wout");
-        let outside = std::env::temp_dir().canonicalize().unwrap().join("nope.jsonl");
+        let outside = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join("nope.jsonl");
         // (guard against the test root accidentally being a parent)
         assert!(!outside.starts_with(&root));
-        let e = resolve_write_path(std::slice::from_ref(&root), outside.to_str().unwrap()).unwrap_err();
+        let e =
+            resolve_write_path(std::slice::from_ref(&root), outside.to_str().unwrap()).unwrap_err();
         assert!(e.contains("outside all approved write roots"), "{e}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -321,10 +349,66 @@ mod tests {
         let outside = tmp_root("wsym-out");
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let via_link = root.join("link").join("evil.jsonl");
-        let e = resolve_write_path(std::slice::from_ref(&root), via_link.to_str().unwrap()).unwrap_err();
+        let e = resolve_write_path(std::slice::from_ref(&root), via_link.to_str().unwrap())
+            .unwrap_err();
         assert!(e.contains("outside all approved write roots"), "{e}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // -- WIRE-1 (LUCIDOTA P0, Letta Code v0.34.24 sibling-prefix fix) -----
+    // The overlay package shipped these as an integration test using
+    // `organelle_host::policy::resolve_write_path`, but `policy` is a
+    // private module (lib.rs: `mod policy;`), so that form cannot
+    // compile. They are wired here as unit tests instead, which keeps
+    // the module boundary unchanged. Source: the 2026-10-25 security
+    // package (lucidota-security-p0-2026-10-25.zip, policy_regression.rs).
+
+    #[test]
+    fn sibling_prefix_is_not_containment() {
+        // Letta's flaw: permitting /x/project inadvertently permitted
+        // /x/project-private via a raw string-prefix check. Rust's
+        // Path::starts_with is component-aware, so this must stay denied.
+        let base = tmp_root("wsib");
+        let allowed = base.join("project");
+        let sibling = base.join("project-private");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let root = allowed.canonicalize().unwrap();
+        let bad = sibling.join("secret.txt");
+        let e = resolve_write_path(std::slice::from_ref(&root), bad.to_str().unwrap()).unwrap_err();
+        assert!(e.contains("outside all approved write roots"), "{e}");
+        // And the real project path itself must still be allowed.
+        let good = allowed.join("secret.txt");
+        assert!(resolve_write_path(std::slice::from_ref(&root), good.to_str().unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_with_nonexistent_target_denied() {
+        // A symlink inside the root pointing outside must stay denied
+        // even when the final path components do not exist yet (the
+        // resolver walks to the nearest existing ancestor, which is the
+        // symlink itself, and canonicalizes through it).
+        let base = tmp_root("wsym-non");
+        let allowed = base.join("allowed");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
+        let bad = allowed
+            .join("link")
+            .join("new")
+            .join("sub")
+            .join("file.txt");
+        let e = resolve_write_path(
+            std::slice::from_ref(&allowed.canonicalize().unwrap()),
+            bad.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(e.contains("outside all approved write roots"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -333,7 +417,8 @@ mod tests {
         // against the canonical path recorded at set time.
         let root = tmp_root("wgone");
         let target = root.join("f.jsonl");
-        let got = resolve_write_path(std::slice::from_ref(&root), target.to_str().unwrap()).unwrap();
+        let got =
+            resolve_write_path(std::slice::from_ref(&root), target.to_str().unwrap()).unwrap();
         assert_eq!(got, target);
         let _ = std::fs::remove_dir_all(&root);
     }

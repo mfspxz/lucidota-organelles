@@ -69,7 +69,9 @@ pub struct GeoPoint {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(GeoPoint { manifest: manifest() })
+    Arc::new(GeoPoint {
+        manifest: manifest(),
+    })
 }
 
 fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
@@ -162,8 +164,12 @@ mod tests {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h
-            .call(&ctx, "gp", "distance",
-                serde_json::json!({"lat1": 91.0, "lon1": 0.0, "lat2": 0.0, "lon2": 0.0}))
+            .call(
+                &ctx,
+                "gp",
+                "distance",
+                serde_json::json!({"lat1": 91.0, "lon1": 0.0, "lat2": 0.0, "lon2": 0.0}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Rejected);
     }

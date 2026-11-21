@@ -83,7 +83,8 @@ fn ingest_claim(h: &Arc<Host>, ctx: &CallContext, token: &str) -> Value {
             "commit": "deadbeef",
         }),
     )
-    .unwrap().output
+    .unwrap()
+    .output
 }
 
 /// A real, hash-matching defeating probe for `tag`.
@@ -331,7 +332,11 @@ fn adv5_supersede_preserves_original_receipt() {
     let claim_seq = r["seq"].as_u64().unwrap();
 
     let raw_before = std::fs::read_to_string(&store).unwrap();
-    let original_line = raw_before.lines().nth(claim_seq as usize).unwrap().to_string();
+    let original_line = raw_before
+        .lines()
+        .nth(claim_seq as usize)
+        .unwrap()
+        .to_string();
 
     h.call(
         &ctx,
@@ -350,7 +355,10 @@ fn adv5_supersede_preserves_original_receipt() {
 
     let raw_after = std::fs::read_to_string(&store).unwrap();
     let original_line_after = raw_after.lines().nth(claim_seq as usize).unwrap();
-    assert_eq!(original_line, original_line_after, "original receipt mutated");
+    assert_eq!(
+        original_line, original_line_after,
+        "original receipt mutated"
+    );
 
     // Chain still verifies; status reports supersede with full linkage.
     let v = h
@@ -376,10 +384,12 @@ fn adv5_supersede_preserves_original_receipt() {
         st.output["superseded_by"]["defeating_probe"]["evidence_ref"],
         json!("probes/a5")
     );
-    assert!(st.output["superseded_by"]["defeating_probe"]["artifact_path"]
-        .as_str()
-        .unwrap()
-        .ends_with(".bin"));
+    assert!(
+        st.output["superseded_by"]["defeating_probe"]["artifact_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(".bin")
+    );
     // Original claim entry still present in history, first.
     assert_eq!(st.output["history"][0]["kind"], json!("claim-ingested"));
     assert_eq!(st.output["history"][0]["seq"], json!(claim_seq));
@@ -501,7 +511,11 @@ fn adv6_r3_v4_attack_replay() {
         json!({"grant_token": m_token, "claim_id": "FC-2", "evidence": good_evidence()}),
     );
     let err = self_attest.unwrap_err();
-    assert!(err.reason.contains("self-attestation"), "reason: {}", err.reason);
+    assert!(
+        err.reason.contains("self-attestation"),
+        "reason: {}",
+        err.reason
+    );
 
     // (d) Mallory replays the OPERATOR's token as herself: DENIED.
     assert!(h

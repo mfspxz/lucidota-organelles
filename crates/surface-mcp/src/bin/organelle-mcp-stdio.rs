@@ -43,10 +43,12 @@ fn main() {
     host.register(ref_time_oracle::organelle()).expect("to");
     host.register(ref_geo_point::organelle()).expect("gp");
     host.register(ref_ledger_append::organelle()).expect("la");
-    host.register(ref_notify::organelle_with_outbox(outbox)).expect("nt");
+    host.register(ref_notify::organelle_with_outbox(outbox))
+        .expect("nt");
     host.register(ref_scrape_extract::organelle()).expect("se");
     host.register(ref_model_call::organelle()).expect("mc");
-    host.register(ref_file_cas::organelle_with_dir(cas_dir)).expect("fc");
+    host.register(ref_file_cas::organelle_with_dir(cas_dir))
+        .expect("fc");
     if let Err(e) = surface_mcp::serve_stdio(host) {
         eprintln!("mcp stdio: {e}");
         std::process::exit(1);

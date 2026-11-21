@@ -119,7 +119,10 @@ impl GrantAuthority {
     /// secrets manager or env). The operator owns key distribution and
     /// rotation; grants minted under a stable key survive host restarts.
     pub fn with_key(key: [u8; 32]) -> Self {
-        GrantAuthority { key, used: HashMap::new() }
+        GrantAuthority {
+            key,
+            used: HashMap::new(),
+        }
     }
 
     /// Create with a fresh 256-bit key from the OS CSPRNG. Fail-closed: if
@@ -132,12 +135,14 @@ impl GrantAuthority {
         );
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes);
-        GrantAuthority { key, used: HashMap::new() }
+        GrantAuthority {
+            key,
+            used: HashMap::new(),
+        }
     }
 
     fn sign(&self, payload_hex: &str) -> String {
-        let mut mac = GrantMac::new_from_slice(&self.key)
-            .expect("HMAC accepts any key length");
+        let mut mac = GrantMac::new_from_slice(&self.key).expect("HMAC accepts any key length");
         mac.update(payload_hex.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
@@ -208,18 +213,20 @@ impl GrantAuthority {
     /// authorized as — caller identity and capabilities derived ONLY from
     /// the trusted grant.
     pub fn verify(&mut self, token: &str) -> Result<VerifiedGrant, GrantError> {
-        let malformed = || GrantError { kind: GrantErrorKind::Malformed };
+        let malformed = || GrantError {
+            kind: GrantErrorKind::Malformed,
+        };
         let (payload_hex, tag_hex) = token.split_once('.').ok_or_else(malformed)?;
         if payload_hex.is_empty() || tag_hex.is_empty() {
             return Err(malformed());
         }
         // Constant-time signature check (hmac's verify_slice).
-        let mut mac = GrantMac::new_from_slice(&self.key)
-            .expect("HMAC accepts any key length");
+        let mut mac = GrantMac::new_from_slice(&self.key).expect("HMAC accepts any key length");
         mac.update(payload_hex.as_bytes());
         let tag = hex::decode(tag_hex).map_err(|_| malformed())?;
-        mac.verify_slice(&tag)
-            .map_err(|_| GrantError { kind: GrantErrorKind::InvalidSignature })?;
+        mac.verify_slice(&tag).map_err(|_| GrantError {
+            kind: GrantErrorKind::InvalidSignature,
+        })?;
 
         let payload_bytes = hex::decode(payload_hex).map_err(|_| malformed())?;
         let payload: GrantPayload =
@@ -232,14 +239,18 @@ impl GrantAuthority {
         }
         let now = unix_now();
         if payload.exp <= now {
-            return Err(GrantError { kind: GrantErrorKind::Expired });
+            return Err(GrantError {
+                kind: GrantErrorKind::Expired,
+            });
         }
 
         if payload.single_use {
             // Prune expired entries so the cache stays bounded.
             self.used.retain(|_, exp| *exp > now);
             if self.used.contains_key(&payload.jti) {
-                return Err(GrantError { kind: GrantErrorKind::Replayed });
+                return Err(GrantError {
+                    kind: GrantErrorKind::Replayed,
+                });
             }
             self.used.insert(payload.jti.clone(), payload.exp);
         }
@@ -315,7 +326,7 @@ mod tests {
     fn expired_denied() {
         let mut a = GrantAuthority::new();
         let g = a.issue("alice", vec![], 0); // exp == now -> expired
-        // exp <= now is expired even at the same second.
+                                             // exp <= now is expired even at the same second.
         assert_eq!(a.verify(&g).unwrap_err().kind, GrantErrorKind::Expired);
     }
 

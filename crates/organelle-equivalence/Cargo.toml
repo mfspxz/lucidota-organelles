@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 organelle-manifest = { workspace = true }
 organelle-host = { workspace = true }
+organelle-typed = { workspace = true }
+ref-typed-hash = { path = "../ref-typed-hash" }
+ref-typed-commit = { path = "../ref-typed-commit" }
 surface-unix = { path = "../surface-unix" }
 surface-mcp = { path = "../surface-mcp" }
 surface-rest = { path = "../surface-rest" }

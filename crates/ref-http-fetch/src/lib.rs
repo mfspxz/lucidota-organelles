@@ -54,7 +54,9 @@ pub struct HttpFetch {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(HttpFetch { manifest: manifest() })
+    Arc::new(HttpFetch {
+        manifest: manifest(),
+    })
 }
 
 impl Organelle for HttpFetch {
@@ -136,7 +138,10 @@ mod tests {
         let h = egress_host(&["127.0.0.1"]);
         let out = fetch_on(&h, &format!("http://127.0.0.1:{port}/")).unwrap();
         assert_eq!(out["status"], serde_json::json!(200));
-        assert!(out["body"].as_str().unwrap().contains("deterministic-fixture"));
+        assert!(out["body"]
+            .as_str()
+            .unwrap()
+            .contains("deterministic-fixture"));
         assert_eq!(out["truncated"], serde_json::json!(false));
     }
 
@@ -179,7 +184,12 @@ mod tests {
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
         let e = h
-            .call(&ctx, "hf", "fetch", serde_json::json!({"url": "http://127.0.0.1:1/"}))
+            .call(
+                &ctx,
+                "hf",
+                "fetch",
+                serde_json::json!({"url": "http://127.0.0.1:1/"}),
+            )
             .unwrap_err();
         assert_eq!(e.verdict, organelle_host::CallVerdict::Denied);
     }

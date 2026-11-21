@@ -136,7 +136,10 @@ impl OrganelleManifest {
                 .or(self.authority.required_capability.as_deref());
             return (mc, cap);
         }
-        (self.authority.mutation_class, self.authority.required_capability.as_deref())
+        (
+            self.authority.mutation_class,
+            self.authority.required_capability.as_deref(),
+        )
     }
 
     pub fn contract(&self, op: &str) -> Option<&Contract> {
@@ -152,7 +155,10 @@ pub struct ManifestError {
 
 impl ManifestError {
     fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
-        ManifestError { field: field.into(), message: message.into() }
+        ManifestError {
+            field: field.into(),
+            message: message.into(),
+        }
     }
 }
 
@@ -168,7 +174,10 @@ fn valid_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
 }
 
 fn valid_codon(codon: &str) -> bool {
@@ -180,15 +189,18 @@ fn valid_codon(codon: &str) -> bool {
 
 fn valid_semver(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn valid_capability(cap: &str) -> bool {
     !cap.is_empty()
         && cap.len() <= 64
-        && cap
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_')
+        && cap.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_'
+        })
 }
 
 /// Structural check of a JSON Schema value (subset we enforce at call time).
@@ -196,15 +208,23 @@ fn check_input_schema(schema: &Value, path: &str, errs: &mut Vec<ManifestError>)
     let obj = match schema.as_object() {
         Some(o) => o,
         None => {
-            errs.push(ManifestError::new(path, "input_schema must be a JSON object"));
+            errs.push(ManifestError::new(
+                path,
+                "input_schema must be a JSON object",
+            ));
             return;
         }
     };
     if let Some(t) = obj.get("type") {
         let ok = matches!(
             t.as_str(),
-            Some("object") | Some("array") | Some("string") | Some("number")
-                | Some("integer") | Some("boolean") | Some("null")
+            Some("object")
+                | Some("array")
+                | Some("string")
+                | Some("number")
+                | Some("integer")
+                | Some("boolean")
+                | Some("null")
         );
         if !ok {
             errs.push(ManifestError::new(
@@ -238,6 +258,19 @@ fn check_input_schema(schema: &Value, path: &str, errs: &mut Vec<ManifestError>)
     if let Some(items) = obj.get("items") {
         check_input_schema(items, &format!("{path}.items"), errs);
     }
+}
+
+/// Validate a JSON Schema's shape — the same checker
+/// `validate_manifest_json` runs over input schemas (type / required
+/// / properties / items, recursive). Public so the typed layer can
+/// validate output schemas with the same depth (F6-H7: the typed
+/// layer's own top-level-type-only check silently ignored malformed
+/// constraints at runtime). Returns every violation found; empty
+/// means the schema shape is well-formed.
+pub fn validate_schema_shape(schema: &Value, path: &str) -> Vec<ManifestError> {
+    let mut errs = Vec::new();
+    check_input_schema(schema, path, &mut errs);
+    errs
 }
 
 /// Validate a manifest from its JSON form. Returns the typed manifest or
@@ -279,20 +312,29 @@ pub fn validate_manifest_json(v: &Value) -> Result<OrganelleManifest, Vec<Manife
         errs.push(ManifestError::new("description", "must be non-empty"));
     }
     if m.contracts.is_empty() {
-        errs.push(ManifestError::new("contracts", "must declare at least one contract"));
+        errs.push(ManifestError::new(
+            "contracts",
+            "must declare at least one contract",
+        ));
     }
     {
         let mut seen = std::collections::HashSet::new();
         for (i, c) in m.contracts.iter().enumerate() {
             let p = format!("contracts[{i}]");
             if c.op.trim().is_empty() || c.op.len() > 64 {
-                errs.push(ManifestError::new(format!("{p}.op"), "op must be 1-64 chars"));
+                errs.push(ManifestError::new(
+                    format!("{p}.op"),
+                    "op must be 1-64 chars",
+                ));
             }
             if !seen.insert(c.op.as_str()) {
                 errs.push(ManifestError::new(format!("{p}.op"), "duplicate op name"));
             }
             if c.description.trim().is_empty() {
-                errs.push(ManifestError::new(format!("{p}.description"), "must be non-empty"));
+                errs.push(ManifestError::new(
+                    format!("{p}.description"),
+                    "must be non-empty",
+                ));
             }
             check_input_schema(&c.input_schema, &format!("{p}.input_schema"), &mut errs);
             if let Some(mc) = c.mutation_class {
@@ -322,7 +364,10 @@ pub fn validate_manifest_json(v: &Value) -> Result<OrganelleManifest, Vec<Manife
     }
     if let Some(cap) = &m.authority.required_capability {
         if !valid_capability(cap) {
-            errs.push(ManifestError::new("authority.required_capability", "invalid capability name"));
+            errs.push(ManifestError::new(
+                "authority.required_capability",
+                "invalid capability name",
+            ));
         }
     }
     for cap in &m.authority.granted_capabilities {
@@ -334,7 +379,10 @@ pub fn validate_manifest_json(v: &Value) -> Result<OrganelleManifest, Vec<Manife
         }
     }
     if m.transports.is_empty() {
-        errs.push(ManifestError::new("transports", "must list at least one transport"));
+        errs.push(ManifestError::new(
+            "transports",
+            "must list at least one transport",
+        ));
     }
     {
         let mut seen = std::collections::HashSet::new();
@@ -443,7 +491,9 @@ pub fn validate_input_against_schema(schema: &Value, input: &Value) -> Result<()
 }
 
 fn check_value(schema: &Value, input: &Value, path: &str, errs: &mut Vec<String>) {
-    let Some(obj) = schema.as_object() else { return };
+    let Some(obj) = schema.as_object() else {
+        return;
+    };
     if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
         let ok = match t {
             "object" => input.is_object(),
@@ -479,10 +529,7 @@ fn check_value(schema: &Value, input: &Value, path: &str, errs: &mut Vec<String>
             }
         }
     }
-    if let (Some(items), Some(arr)) = (
-        obj.get("items"),
-        input.as_array(),
-    ) {
+    if let (Some(items), Some(arr)) = (obj.get("items"), input.as_array()) {
         for (i, v) in arr.iter().enumerate() {
             check_value(items, v, &format!("{path}[{i}]"), errs);
         }
@@ -535,9 +582,7 @@ pub fn canonical_json(v: &Value) -> String {
                         '\n' => out.push_str("\\n"),
                         '\r' => out.push_str("\\r"),
                         '\t' => out.push_str("\\t"),
-                        c if (c as u32) < 0x20 => {
-                            out.push_str(&format!("\\u{:04x}", c as u32))
-                        }
+                        c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
                         c => out.push(c),
                     }
                 }
@@ -627,7 +672,20 @@ pub fn utc_now_iso() -> String {
         days -= dy;
         y += 1;
     }
-    let months = [31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31,
+        if is_leap(y) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mo = 0;
     while days >= months[mo] {
         days -= months[mo];
@@ -719,9 +777,15 @@ mod tests {
     fn mutating_contract_without_capability_rejected() {
         // Fail-closed: Write contract, no capability anywhere -> invalid.
         let mut v = good_manifest_json();
-        v["contracts"][0].as_object_mut().unwrap().remove("required_capability");
+        v["contracts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("required_capability");
         let errs = validate_manifest_json(&v).unwrap_err();
-        assert!(errs.iter().any(|e| e.message.contains("fail-closed")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.message.contains("fail-closed")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -780,10 +844,16 @@ mod tests {
             "properties": {"key": {"type": "string"}, "n": {"type": "integer", "minimum": 1}}
         });
         assert!(validate_input_against_schema(&schema, &serde_json::json!({"key": "a"})).is_ok());
-        assert!(validate_input_against_schema(&schema, &serde_json::json!({"key": "a", "n": 3})).is_ok());
+        assert!(
+            validate_input_against_schema(&schema, &serde_json::json!({"key": "a", "n": 3}))
+                .is_ok()
+        );
         assert!(validate_input_against_schema(&schema, &serde_json::json!({})).is_err());
         assert!(validate_input_against_schema(&schema, &serde_json::json!({"key": 5})).is_err());
-        assert!(validate_input_against_schema(&schema, &serde_json::json!({"key": "a", "n": 0})).is_err());
+        assert!(
+            validate_input_against_schema(&schema, &serde_json::json!({"key": "a", "n": 0}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -795,7 +865,11 @@ mod tests {
                 "tags": {"type": "array", "items": {"type": "string"}}
             }
         });
-        assert!(validate_input_against_schema(&schema, &serde_json::json!({"mode": "a", "tags": ["x"]})).is_ok());
+        assert!(validate_input_against_schema(
+            &schema,
+            &serde_json::json!({"mode": "a", "tags": ["x"]})
+        )
+        .is_ok());
         assert!(validate_input_against_schema(&schema, &serde_json::json!({"mode": "z"})).is_err());
         assert!(validate_input_against_schema(&schema, &serde_json::json!({"tags": [1]})).is_err());
     }

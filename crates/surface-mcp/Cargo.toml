@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 organelle-manifest = { workspace = true }
 organelle-host = { workspace = true }
+organelle-typed = { workspace = true }
 ref-kv-store = { path = "../ref-kv-store" }
 ref-text-transform = { path = "../ref-text-transform" }
 ref-hash-seal = { path = "../ref-hash-seal" }
@@ -25,3 +26,4 @@ hex = { workspace = true }
 
 [dev-dependencies]
 organelle-host = { workspace = true }
+ref-typed-hash = { path = "../ref-typed-hash" }

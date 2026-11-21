@@ -48,7 +48,9 @@ pub struct JsonValidate {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(JsonValidate { manifest: manifest() })
+    Arc::new(JsonValidate {
+        manifest: manifest(),
+    })
 }
 
 impl Organelle for JsonValidate {
@@ -104,9 +106,14 @@ mod tests {
         let h = Host::new();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
-        h.call(&ctx, "jv", "validate", serde_json::json!({"value": value, "schema": schema}))
-            .unwrap()
-            .output
+        h.call(
+            &ctx,
+            "jv",
+            "validate",
+            serde_json::json!({"value": value, "schema": schema}),
+        )
+        .unwrap()
+        .output
     }
 
     #[test]

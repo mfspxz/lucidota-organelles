@@ -56,7 +56,10 @@ pub struct TimeOracle {
 }
 
 pub fn organelle() -> Arc<dyn Organelle> {
-    Arc::new(TimeOracle { manifest: manifest(), start: Instant::now() })
+    Arc::new(TimeOracle {
+        manifest: manifest(),
+        start: Instant::now(),
+    })
 }
 
 impl Organelle for TimeOracle {
@@ -94,7 +97,10 @@ mod tests {
         let h = Host::new();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
-        let out = h.call(&ctx, "to", "now", serde_json::json!({})).unwrap().output;
+        let out = h
+            .call(&ctx, "to", "now", serde_json::json!({}))
+            .unwrap()
+            .output;
         assert!(out["utc_iso"].as_str().unwrap().ends_with('Z'));
         assert!(out["unix_secs"].as_u64().unwrap() > 1_700_000_000);
     }
@@ -104,8 +110,14 @@ mod tests {
         let h = Host::new();
         h.register(organelle()).unwrap();
         let ctx = CallContext::new("test", vec![]);
-        let a = h.call(&ctx, "to", "tick", serde_json::json!({})).unwrap().output;
-        let b = h.call(&ctx, "to", "tick", serde_json::json!({})).unwrap().output;
+        let a = h
+            .call(&ctx, "to", "tick", serde_json::json!({}))
+            .unwrap()
+            .output;
+        let b = h
+            .call(&ctx, "to", "tick", serde_json::json!({}))
+            .unwrap()
+            .output;
         assert!(b["monotonic_nanos"].as_u64().unwrap() >= a["monotonic_nanos"].as_u64().unwrap());
     }
 

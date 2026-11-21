@@ -23,8 +23,8 @@
 //! cross-wire.
 
 use organelle_host::{
-    CallContext, CallError, CallOk, CallVerdict, Host, HostRef, Organelle, OrganelleError,
-    Receipt, ReceiptKind,
+    CallContext, CallError, CallOk, CallVerdict, Host, HostRef, Organelle, OrganelleError, Receipt,
+    ReceiptKind,
 };
 use organelle_manifest::{
     hash_value, Authority, Contract, MutationClass, OrganelleManifest, ReceiptPolicy, Transport,
@@ -105,7 +105,10 @@ impl Organelle for Corr {
 
 fn host() -> Arc<Host> {
     let h = Host::new();
-    h.register(Arc::new(Corr { manifest: manifest() })).unwrap();
+    h.register(Arc::new(Corr {
+        manifest: manifest(),
+    }))
+    .unwrap();
     h
 }
 
@@ -132,15 +135,20 @@ fn assert_correlated(h: &Host, expectations: &[Expectation], ids: &[String], bas
         assert!(!id.is_empty(), "empty receipt id returned");
         assert!(seen.insert(id.as_str()), "duplicate receipt id {id}");
     }
-    let store: HashMap<String, Receipt> =
-        h.receipts().into_iter().map(|r| (r.id.clone(), r)).collect();
+    let store: HashMap<String, Receipt> = h
+        .receipts()
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect();
     assert_eq!(
         store.len() - baseline,
         ids.len(),
         "store must hold exactly one receipt per invocation"
     );
     for (id, exp) in ids.iter().zip(expectations.iter()) {
-        let r = store.get(id).unwrap_or_else(|| panic!("receipt {id} missing from store"));
+        let r = store
+            .get(id)
+            .unwrap_or_else(|| panic!("receipt {id} missing from store"));
         assert_eq!(r.kind, ReceiptKind::Invocation, "receipt {id} kind");
         assert_eq!(r.caller, exp.caller, "receipt {id} caller");
         assert_eq!(r.codon, "co", "receipt {id} codon");
@@ -257,7 +265,12 @@ fn concurrent_mixed_verdicts_no_cross_wiring() {
                     0 => {
                         // Ok
                         let ok = h
-                            .call(&CallContext::new(&caller, vec![]), "co", "echo", input.clone())
+                            .call(
+                                &CallContext::new(&caller, vec![]),
+                                "co",
+                                "echo",
+                                input.clone(),
+                            )
                             .unwrap();
                         assert_eq!(ok.output["echo"], input);
                         out.push((
@@ -273,7 +286,12 @@ fn concurrent_mixed_verdicts_no_cross_wiring() {
                     1 => {
                         // Denied: missing capability.
                         let e = h
-                            .call(&CallContext::new(&caller, vec![]), "co", "gated", input.clone())
+                            .call(
+                                &CallContext::new(&caller, vec![]),
+                                "co",
+                                "gated",
+                                input.clone(),
+                            )
                             .unwrap_err();
                         assert_eq!(e.verdict, CallVerdict::Denied);
                         out.push((
@@ -290,7 +308,12 @@ fn concurrent_mixed_verdicts_no_cross_wiring() {
                         // Failed: organelle error. The error still carries
                         // the exact receipt id (filled at emission time).
                         let e = h
-                            .call(&CallContext::new(&caller, vec![]), "co", "boom", input.clone())
+                            .call(
+                                &CallContext::new(&caller, vec![]),
+                                "co",
+                                "boom",
+                                input.clone(),
+                            )
                             .unwrap_err();
                         assert_eq!(e.verdict, CallVerdict::Failed);
                         assert!(!e.receipt_id.is_empty());

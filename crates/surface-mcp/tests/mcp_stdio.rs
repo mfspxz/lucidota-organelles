@@ -9,8 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 /// Test-only grant key (NOT a secret — 32 zero bytes, hex).
-const TEST_GRANT_KEY_HEX: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+const TEST_GRANT_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn test_host() -> Arc<organelle_host::Host> {
     organelle_host::Host::with_grant_key([0u8; 32])
@@ -18,11 +17,7 @@ fn test_host() -> Arc<organelle_host::Host> {
 
 /// Mint a grant the child will accept (same key as the child's).
 fn grant(caller: &str, caps: &[&str]) -> String {
-    test_host().issue_grant(
-        caller,
-        caps.iter().map(|s| s.to_string()).collect(),
-        300,
-    )
+    test_host().issue_grant(caller, caps.iter().map(|s| s.to_string()).collect(), 300)
 }
 
 struct Mcp {
@@ -47,7 +42,11 @@ impl Mcp {
 
     fn spawn() -> Self {
         let bin = Self::bin_path();
-        assert!(bin.exists(), "mcp stdio binary missing at {}", bin.display());
+        assert!(
+            bin.exists(),
+            "mcp stdio binary missing at {}",
+            bin.display()
+        );
         let mut child = Command::new(bin)
             .env("ORGANELLE_GRANT_KEY", TEST_GRANT_KEY_HEX)
             .stdin(Stdio::piped())
@@ -57,13 +56,19 @@ impl Mcp {
             .expect("spawn mcp stdio server");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        Mcp { child, stdin, reader: BufReader::new(stdout), next_id: 1 }
+        Mcp {
+            child,
+            stdin,
+            reader: BufReader::new(stdout),
+            next_id: 1,
+        }
     }
 
     fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let id = self.next_id;
         self.next_id += 1;
-        let msg = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let msg =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         writeln!(self.stdin, "{}", serde_json::to_string(&msg).unwrap()).unwrap();
         self.stdin.flush().unwrap();
         let mut line = String::new();
@@ -83,7 +88,10 @@ impl Drop for Mcp {
 fn initialize_and_list() {
     let mut m = Mcp::spawn();
     let init = m.request("initialize", serde_json::json!({}));
-    assert_eq!(init["result"]["serverInfo"]["name"], serde_json::json!("parkwreck-organelle-host"));
+    assert_eq!(
+        init["result"]["serverInfo"]["name"],
+        serde_json::json!("parkwreck-organelle-host")
+    );
     let list = m.request("tools/list", serde_json::json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 19, "{tools:?}"); // 4+1+1+1+2+2+2+1+1+1+1+2 across 12 organelles
@@ -120,7 +128,10 @@ fn call_denied_is_error_not_crash() {
         }),
     );
     assert_eq!(out["result"]["isError"], serde_json::json!(true));
-    assert!(out["result"]["content"][0]["text"].as_str().unwrap().contains("Denied"));
+    assert!(out["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Denied"));
 }
 
 #[test]
@@ -151,7 +162,10 @@ fn forged_grant_over_stdio_denied() {
 fn unknown_tool_and_method() {
     let mut m = Mcp::spawn();
     let _ = m.request("initialize", serde_json::json!({}));
-    let out = m.request("tools/call", serde_json::json!({"name": "nope.nope", "arguments": {}}));
+    let out = m.request(
+        "tools/call",
+        serde_json::json!({"name": "nope.nope", "arguments": {}}),
+    );
     assert_eq!(out["error"]["code"], serde_json::json!(-32602));
     let out2 = m.request("frobnicate", serde_json::json!({}));
     assert_eq!(out2["error"]["code"], serde_json::json!(-32601));

@@ -157,10 +157,14 @@ fn proxy(
 #[test]
 fn scoped_grant_cross_organelle_reuse_denied() {
     let h = Host::new();
-    h.register(Arc::new(Echo { manifest: manifest("aa", "ping", "ping.use", vec![]) }))
-        .unwrap();
-    h.register(Arc::new(Echo { manifest: manifest("bb", "ping", "ping.use", vec![]) }))
-        .unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("aa", "ping", "ping.use", vec![]),
+    }))
+    .unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("bb", "ping", "ping.use", vec![]),
+    }))
+    .unwrap();
     let grant = h.issue_scoped_grant("alice", "aa", vec!["ping.use".to_string()], 300);
     // The intended organelle: proceeds.
     let ok = h
@@ -204,14 +208,25 @@ fn scoped_grant_cross_organelle_reuse_denied() {
 fn unscoped_grant_still_invokes_any_organelle() {
     // Back-compat: grants without an audience are not codon-confined.
     let h = Host::new();
-    h.register(Arc::new(Echo { manifest: manifest("aa", "ping", "ping.use", vec![]) }))
-        .unwrap();
-    h.register(Arc::new(Echo { manifest: manifest("bb", "ping", "ping.use", vec![]) }))
-        .unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("aa", "ping", "ping.use", vec![]),
+    }))
+    .unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("bb", "ping", "ping.use", vec![]),
+    }))
+    .unwrap();
     let grant = h.issue_grant("alice", vec!["ping.use".to_string()], 300);
     for codon in ["aa", "bb"] {
-        h.call_with_grant(&grant, Some("alice"), Transport::Native, codon, "ping", serde_json::json!({}))
-            .unwrap();
+        h.call_with_grant(
+            &grant,
+            Some("alice"),
+            Transport::Native,
+            codon,
+            "ping",
+            serde_json::json!({}),
+        )
+        .unwrap();
     }
 }
 
@@ -220,8 +235,10 @@ fn scoped_grant_without_capability_still_denied() {
     // Audience binding is not a capability bypass: the scoped organelle's
     // own required capabilities still apply.
     let h = Host::new();
-    h.register(Arc::new(Echo { manifest: manifest("aa", "ping", "ping.use", vec![]) }))
-        .unwrap();
+    h.register(Arc::new(Echo {
+        manifest: manifest("aa", "ping", "ping.use", vec![]),
+    }))
+    .unwrap();
     let grant = h.issue_scoped_grant("alice", "aa", vec![], 300);
     let e = h
         .call_with_grant(
@@ -247,7 +264,13 @@ fn chain_host() -> (Arc<Host>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let px_hits = Arc::new(AtomicUsize::new(0));
     let sk_hits = Arc::new(AtomicUsize::new(0));
     h.register(Arc::new(proxy(
-        "px", "relay", "proxy.use", &["model.call"], "sk", "use", px_hits.clone(),
+        "px",
+        "relay",
+        "proxy.use",
+        &["model.call"],
+        "sk",
+        "use",
+        px_hits.clone(),
     )))
     .unwrap();
     h.register(Arc::new(Sink {
@@ -358,11 +381,23 @@ fn grant_confinement_is_transitive() {
     let md_hits = Arc::new(AtomicUsize::new(0));
     let dp_hits = Arc::new(AtomicUsize::new(0));
     h.register(Arc::new(proxy(
-        "px", "relay", "proxy.use", &["model.call"], "md", "relay2", px_hits.clone(),
+        "px",
+        "relay",
+        "proxy.use",
+        &["model.call"],
+        "md",
+        "relay2",
+        px_hits.clone(),
     )))
     .unwrap();
     h.register(Arc::new(proxy(
-        "md", "relay2", "model.call", &["deep.call"], "dp", "use", md_hits.clone(),
+        "md",
+        "relay2",
+        "model.call",
+        &["deep.call"],
+        "dp",
+        "use",
+        md_hits.clone(),
     )))
     .unwrap();
     h.register(Arc::new(Sink {
