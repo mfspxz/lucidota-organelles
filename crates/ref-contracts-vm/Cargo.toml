@@ -1,0 +1,29 @@
+[package]
+name = "ref-contracts-vm"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+
+# Harvested BY COPY from pt-contracts (pt-crypto-infra treatment
+# tree, ~/workspace/full-send/projects/pt-crypto-infra/app/pt-contracts).
+# The source manifest declares a pt-coin path dependency; the
+# harvested source never actually imports pt_coin (only doc
+# comments name it — the VM trusts a pre-verified kernel-signature
+# flag instead). The dependency is therefore NOT carried here;
+# that is a recorded manifest adaptation, not a source change
+# (see APPLICATION.md). sha2 + thiserror mirror the source.
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the pure
+# VM turn this off (default-features = false).
+organelle = ["dep:organelle-manifest", "dep:organelle-host", "dep:serde_json"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+sha2 = { workspace = true }
+thiserror = "1"
+# Only the organelle glue uses serde_json (manifest + op payloads);
+# the harvested VM itself does not.
+serde_json = { workspace = true, optional = true }

@@ -1,0 +1,34 @@
+[package]
+name = "ref-entropy-source"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface.  Backend-activation consumers turn this
+# off (default-features = false) so feature unification is all they buy:
+# no organelle-host/manifest enters their graph, which also keeps this
+# crate usable by workspaces pinned to a forked organelle substrate.
+organelle = ["dep:organelle-manifest", "dep:organelle-host", "dep:serde", "dep:serde_json", "dep:hex"]
+# Feature unification is the product: a consumer selects exactly one of
+# these for the getrandom major/minor line already present in its graph.
+# The optional target-only dependency below then turns on upstream's
+# WebCrypto-backed WASM backend for every getrandom user in that build.
+getrandom-0_2 = ["dep:getrandom02"]
+getrandom-0_3 = ["dep:getrandom03"]
+getrandom-0_4 = ["dep:getrandom04"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Crypto"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"], optional = true }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"], optional = true }

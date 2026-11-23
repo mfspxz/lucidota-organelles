@@ -1,0 +1,23 @@
+[package]
+name = "ref-code-graph-parse"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the pure
+# parser (e.g. wreck-graph's enclosing_functions drop-in) turn this
+# off so no host/manifest deps enter their graph.
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ref-graph-store = { path = "../ref-graph-store", default-features = false }
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"

@@ -1,0 +1,37 @@
+[package]
+name = "ref-mem0-client"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle", "native"]
+# The Organelle trait surface.  Consumers that only want the client
+# API turn this off (default-features = false) so no host/manifest
+# deps enter their graph — the same discipline as ref-entropy-source
+# through ref-model-call-live.
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+# Native transport backend, forwarded to ref-https-transport's
+# ureq 3 + rustls client.  The transport dependency itself is
+# target-gated inside ref-https-transport, so this feature is a
+# no-op switch on wasm32, where callers inject a host-fetch
+# transport through the async seam instead.
+native = ["ref-https-transport/native"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# The transport every Mem0 call rides on (org-026).
+# default-features = false: this crate defines its own organelle
+# surface; it does not need the transport's.
+ref-https-transport = { path = "../ref-https-transport", default-features = false }
+
+# Wasm clock: wasm32-unknown-unknown has no std clock (SystemTime /
+# Instant trap with `unreachable` — proven 2026-11-23), so the
+# crate's time helpers read the host Date on that target, the same
+# resolution org-035 uses.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"

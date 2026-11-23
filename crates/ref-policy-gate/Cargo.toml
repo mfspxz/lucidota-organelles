@@ -1,0 +1,21 @@
+[package]
+name = "ref-policy-gate"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface.  Consumers that only want the pure
+# evaluator API turn this off (default-features = false) so no
+# host/manifest deps enter their graph — the same discipline as
+# ref-entropy-source, ref-https-transport, ref-cf-storage and
+# ref-credential-broker.
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

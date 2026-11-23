@@ -1,0 +1,38 @@
+[package]
+name = "ref-keystore"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+
+# Harvested BY COPY from pt-keystore (pt-crypto-infra treatment tree,
+# ~/workspace/full-send/projects/pt-crypto-infra/app/pt-keystore).
+# Dependency set mirrors the source manifest exactly; the only
+# additions are the organelle glue deps (optional, behind the
+# default `organelle` feature).
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the pure
+# keystore turn this off (default-features = false).
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = "1"
+getrandom = "0.2"
+
+# org-025 remedy: the dependency graph pulls getrandom 0.2 (via
+# rand_core 0.6 / ed25519-dalek) with no wasm backend enabled.
+# Enable the JS backend for wasm32 only, in this crate, exactly
+# as org-025 prescribes.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

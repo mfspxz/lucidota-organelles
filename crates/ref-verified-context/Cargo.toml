@@ -1,0 +1,47 @@
+[package]
+name = "ref-verified-context"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+
+# Harvested BY COPY from pt-compose (treatment-lane composition crate,
+# ~/workspace/full-send/projects/pt-crypto-infra/app/pt-compose).
+# The wiring composes the recovered pt crypto-infrastructure trio.
+# Since organelle harvest wave 2 (ORGANELLE-HARVEST-2.md), the trio
+# are organelles of their own — ref-keystore / ref-contracts-vm /
+# ref-evidence-gate — and this crate consumes them as crate deps
+# under dependency renames (package = "ref-*", exposed to the code
+# under the original pt-* names), so the harvested compose.rs keeps
+# compiling byte-identical. No path into the campaign tree remains.
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the pure
+# wiring turn this off (default-features = false).
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+pt-keystore = { package = "ref-keystore", path = "../ref-keystore", default-features = false }
+pt-contracts = { package = "ref-contracts-vm", path = "../ref-contracts-vm", default-features = false }
+pt-forged = { package = "ref-evidence-gate", path = "../ref-evidence-gate", default-features = false }
+ed25519-dalek = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "1"
+
+# org-025 remedy: the pt-* dependency graph pulls getrandom (via
+# rand_core 0.6 / ed25519-dalek and via rand 0.10) with no wasm
+# backend enabled. Enable the JS backend for wasm32 only, in the
+# consuming crate, exactly as org-025 prescribes.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+pt-keystore = { package = "ref-keystore", path = "../ref-keystore", default-features = false }
+pt-contracts = { package = "ref-contracts-vm", path = "../ref-contracts-vm", default-features = false }
+pt-forged = { package = "ref-evidence-gate", path = "../ref-evidence-gate", default-features = false }
+serde_json = "1"

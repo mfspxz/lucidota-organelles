@@ -1,0 +1,51 @@
+[package]
+name = "ref-model-call-live"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle", "native"]
+# The Organelle trait surface.  Consumers that only want the caller
+# API turn this off (default-features = false) so no host/manifest
+# deps enter their graph — the same discipline as ref-entropy-source
+# through ref-replay-registry.
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+# Native transport backend, forwarded to ref-https-transport's
+# ureq 3 + rustls client.  The transport dependency itself is
+# target-gated inside ref-https-transport, so this feature is a
+# no-op switch on wasm32, where callers inject a host-fetch
+# transport instead.
+native = ["ref-https-transport/native"]
+# Breaker/quota composition over ref-breaker-quota (org-032):
+# BreakerQuotaGuard adapts SyncBreaker / SyncQuota to this crate's
+# plain CallGuard trait.  Off by default — the guard seam is a
+# two-method trait and most embedders start with NoGuard.
+guard-bq = ["dep:ref-breaker-quota"]
+
+[dependencies]
+futures-core = "0.3"
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# The transport every provider call rides on (org-026).
+# default-features = false: this crate defines its own organelle
+# surface; it does not need the transport's.  The `native` feature
+# above forwards to the transport's ureq backend.
+ref-https-transport = { path = "../ref-https-transport", default-features = false }
+# CredentialRef — the org-028 identifier type (name + scope, safe
+# to log).  Secret values never come from this crate; they arrive
+# through this crate's CredentialResolver trait, implemented by the
+# host over its own provisioning (see APPLICATION.md).
+ref-credential-broker = { path = "../ref-credential-broker", default-features = false }
+# Optional guard composition (org-032 state machines).
+ref-breaker-quota = { path = "../ref-breaker-quota", default-features = false, optional = true }
+
+# Wasm clock: wasm32-unknown-unknown has no std clock (SystemTime /
+# Instant trap with `unreachable` — proven 2026-11-23), so the
+# crate's time helpers read the host Date on that target, the same
+# resolution org-026 uses for host functions.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"

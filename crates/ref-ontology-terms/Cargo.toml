@@ -1,0 +1,20 @@
+[package]
+name = "ref-ontology-terms"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the term
+# store turn this off (default-features = false); the store itself
+# needs only serde/serde_json (for load_from_json + term records).
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "ref-payout-split"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# JSONL persistence for the split ledger (entry records, verified on
+# load).  The split math and the in-memory ledger are std-only and
+# compile with default-features = false.
+jsonl = ["dep:serde", "dep:serde_json"]
+# The Organelle trait surface.
+organelle = ["jsonl", "dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

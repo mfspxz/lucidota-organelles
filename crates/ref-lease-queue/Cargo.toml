@@ -1,0 +1,29 @@
+[package]
+name = "ref-lease-queue"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface.  Consumers that only want the pure
+# queue API turn this off (default-features = false) so no
+# host/manifest deps enter their graph — the same discipline as
+# ref-entropy-source, ref-https-transport, ref-cf-storage,
+# ref-credential-broker and ref-policy-gate.
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+# SQLite storage backend (rusqlite, bundled — the estate's native
+# practice).  Native-only: the dependency is target-gated below and
+# the backend module is cfg-gated out on wasm32, where storage is
+# the host's problem (D1/KV adapters compose over the Store trait).
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }

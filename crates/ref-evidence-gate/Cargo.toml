@@ -1,0 +1,24 @@
+[package]
+name = "ref-evidence-gate"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+
+# Harvested BY COPY from pt-forged (pt-crypto-infra treatment tree,
+# ~/workspace/full-send/projects/pt-crypto-infra/app/pt-forged).
+# Dependency set mirrors the source manifest (regex + serde +
+# serde_json); organelle glue deps are optional, behind the
+# default `organelle` feature.
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the pure
+# gate turn this off (default-features = false).
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+regex = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }

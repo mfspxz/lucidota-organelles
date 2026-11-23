@@ -1,0 +1,32 @@
+# The minimal edge worker: shell + one organelle + route
+# handlers, nothing else.  This crate is the adoption proof for
+# ref-edge-worker-shell (org-031) — it is deliberately NOT a
+# member of the organelles workspace (note the empty [workspace]
+# table detaching it), because a real consumer's worker is its
+# own crate with its own lockfile, exactly like this one.
+#
+# Verify:  cargo check --target wasm32-unknown-unknown --offline
+# Deploy:  a wrangler.toml naming the bindings the code states —
+#            HEARTBEAT_SECRET (secret), STATE (kv namespace) —
+#            and a [build] running worker-build, as with the
+#            Exchange's worker.  Deployment is the consumer's
+#            step; this crate's contract ends at compiling
+#            against the real runtime types.
+[package]
+name = "minimal-edge-worker"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+worker = { version = "0.8" }
+serde_json = "1"
+ref-edge-worker-shell = { path = "../..", features = ["workers"] }
+# The one organelle this worker assembles: entropy for nonces.
+# default-features = false — only the plain fill_bytes API is
+# used, so no host/manifest deps enter the graph.
+ref-entropy-source = { path = "../../../ref-entropy-source", default-features = false }

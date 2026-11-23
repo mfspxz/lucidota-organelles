@@ -1,0 +1,21 @@
+[package]
+name = "ref-template-engine"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the pure
+# engine turn this off (default-features = false) so no
+# host/manifest/serde deps enter their graph. The engine core
+# (engine + render + value) is std-only and target-independent.
+organelle = ["dep:organelle-manifest", "dep:organelle-host", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

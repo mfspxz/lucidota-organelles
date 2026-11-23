@@ -1,0 +1,31 @@
+[package]
+name = "ref-credential-broker"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle", "native"]
+# The Organelle trait surface.  Consumers that only want the broker
+# API turn this off (default-features = false) so no host/manifest
+# deps enter their graph — the same discipline as ref-entropy-source,
+# ref-https-transport and ref-cf-storage.
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+# Native transport backend for the broker's default transport
+# (ref-https-transport's ureq 3 + rustls client).  The transport
+# dependency itself is target-gated inside ref-https-transport, so
+# this feature is a no-op switch on wasm32, where brokered requests
+# need a caller-supplied transport (host fetch).
+native = ["ref-https-transport/native"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# The transport the broker performs authenticated requests over.
+# default-features = false: this crate defines its own organelle
+# surface; it does not need the transport's.  The `native` feature
+# above forwards to the transport's ureq backend.
+ref-https-transport = { path = "../ref-https-transport", default-features = false }

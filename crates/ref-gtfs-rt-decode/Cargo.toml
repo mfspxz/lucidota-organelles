@@ -1,0 +1,20 @@
+[package]
+name = "ref-gtfs-rt-decode"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface.  Consumers that only want the pure
+# decoder turn this off (default-features = false) so no
+# host/manifest/serde deps enter their graph — the same discipline
+# as ref-entropy-source through ref-model-call-live.  The decoder
+# core itself is std-only and target-independent.
+organelle = ["dep:organelle-manifest", "dep:organelle-host", "dep:serde", "dep:serde_json", "dep:hex"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }

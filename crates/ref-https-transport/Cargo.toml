@@ -1,0 +1,56 @@
+[package]
+name = "ref-https-transport"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle", "native"]
+# The Organelle trait surface.  Consumers that only want the client API
+# turn this off (default-features = false) so no host/manifest deps
+# enter their graph — the same discipline as ref-entropy-source.
+organelle = ["dep:organelle-manifest", "dep:organelle-host", "dep:serde", "dep:serde_json"]
+# Native blocking client (ureq + rustls).  The ureq dependency itself is
+# target-gated to non-wasm32 below, so this feature is a no-op switch on
+# wasm32, where the fetch-based async client is the transport.
+native = ["dep:ureq"]
+
+[dependencies]
+futures-core = "0.3"
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+# Native transport: ureq 3 with its rustls backend and the platform
+# verifier (OS root store — the same trust decision curl/urllib make,
+# and the only one that verifies peers behind TLS-intercepting egress
+# proxies whose CA is installed system-wide).  NO native-tls / openssl
+# anywhere in this graph.
+#
+# ureq 3, not the ureq 2.12.1 the wreck-adapters lane uses: ureq 2's
+# send_prelude rewrites the request target to absolute-form whenever
+# ANY HTTP proxy is configured (unit.rs, "HTTP proxies require the
+# path to be in absolute URI form") — including inside an HTTPS
+# CONNECT tunnel, where strict proxies close the connection on sight.
+# Proven against this sandbox's egress proxy 2026-11-22; ureq 3 sends
+# origin-form in tunnels.  See APPLICATION.md.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3.5.2", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
+
+# Wasm transport: the host fetch API via web-sys (Workers / browser).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "AbortController",
+    "AbortSignal",
+    "Headers",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Window",
+] }
+

@@ -1,0 +1,30 @@
+[package]
+name = "ref-epistemic-gate"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle"]
+# The Organelle trait surface. Consumers that only want the pure
+# gate turn this off (default-features = false).
+organelle = ["dep:organelle-manifest", "dep:organelle-host"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+ref-ontology-terms = { path = "../ref-ontology-terms", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Gate-receipt signing (ported 2026-11-23 from pt-oracle commit 1e22c3f):
+# ed25519-dalek 2.2.0 was already in the local registry cache (DeCENT
+# treatment); no new download source.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
+# wasm32: getrandom (via rand / ed25519-dalek rand_core) needs its `js`
+# backend enabled on wasm*-unknown-unknown — the org-025 failure class.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

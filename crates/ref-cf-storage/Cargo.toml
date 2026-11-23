@@ -1,0 +1,38 @@
+[package]
+name = "ref-cf-storage"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = ["organelle", "native"]
+# The Organelle trait surface.  Consumers that only want the client /
+# bindings API turn this off (default-features = false) so no
+# host/manifest deps enter their graph — the same discipline as
+# ref-entropy-source and ref-https-transport.
+organelle = ["dep:organelle-manifest", "dep:organelle-host", "dep:serde"]
+# Native REST client backend (via ref-https-transport: ureq 3 +
+# rustls, platform verifier, NO native-tls / openssl).  The transport
+# dependency itself is target-gated inside ref-https-transport, so
+# this feature is a no-op switch on wasm32, where the Workers
+# bindings API (async) is the storage surface.
+native = ["ref-https-transport/native"]
+
+[dependencies]
+organelle-manifest = { workspace = true, optional = true }
+organelle-host = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true }
+# The transport trait + native client.  default-features = false:
+# this crate defines its own organelle surface; it does not need the
+# transport's.  The `native` feature above forwards to the
+# transport's ureq backend.
+ref-https-transport = { path = "../ref-https-transport", default-features = false }
+
+# Workers bindings backend: hand-rolled over wasm-bindgen / js-sys
+# (the ref-entropy-source pattern — Reflect + JsFuture against the
+# runtime objects) rather than the full workers-rs tree, so the
+# crate's graph stays small and target-honest.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
